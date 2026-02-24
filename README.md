@@ -8,7 +8,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for [
 
 ## Features
 
-- **8 MCP tools** for model consultation, listing, requirements analysis, and plan execution
+- **10 MCP tools** for model consultation, listing, requirements analysis, and plan execution
 - **Code-based complexity scoring (0-10)** using lexical, semantic, scope, and uncertainty features — no LLM calls needed for scoring
 - **Task type classification** into 9 categories: docs, code, test, refactor, script, debug, security, architecture, research
 - **Deterministic routing table** mapping `(complexity score, task type)` to the optimal model
@@ -24,6 +24,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for [
 | **OpenRouter** | DeepSeek V3.2, Qwen 3.5, GLM-5, Minimax M2.5 | Scripts, boilerplate, CRUD |
 | **Requesty.ai** | 300+ models (auto-failover) | Fallback router, direct model access |
 | **OpenAI Codex CLI** | gpt-5.3-codex and variants | Feature impl, refactors, bulk codegen |
+| **Local Inference** | Ollama, LM Studio, vLLM, MLX, LocalAI | Zero-cost, low-latency simple tasks |
 
 ## Prerequisites
 
@@ -67,6 +68,8 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json` or project `.cla
 | `GEMINI_API_KEY` | No* | Google AI Studio API key for Gemini models |
 | `OPENROUTER_API_KEY` | No* | OpenRouter API key for DeepSeek/Qwen/GLM/Minimax |
 | `REQUESTY_API_KEY` | No* | Requesty.ai API key (fallback router, 300+ models) |
+| `LOCAL_MODEL_BASE_URL` | No | Override auto-detected local server URL (e.g., `http://192.168.1.100:11434/v1`) |
+| `LOCAL_MODEL_PROVIDER` | No | Hint for auto-detection: `ollama`, `lmstudio`, `vllm`, `mlx`, or `localai` |
 
 \* At least one key is needed. Each provider works independently — configure only the ones you want.
 
@@ -87,6 +90,20 @@ If you have the [OpenAI Codex CLI](https://github.com/openai/codex) installed, t
 npm install -g @openai/codex
 codex login
 ```
+
+### 5. Optional: Local Inference Server
+
+The router auto-detects locally-running inference servers on startup. All 5 supported providers expose an OpenAI-compatible `/v1/chat/completions` endpoint. Install any one:
+
+| Provider | Install | Default Port |
+|----------|---------|-------------|
+| **Ollama** | `curl -fsSL https://ollama.ai/install.sh \| sh && ollama pull llama3.2` | 11434 |
+| **LM Studio** | Download from [lmstudio.ai](https://lmstudio.ai), start local server | 1234 |
+| **vLLM** | `pip install vllm && vllm serve <model>` | 8000 |
+| **MLX** | `pip install mlx-lm && mlx_lm.server` (macOS M-series only) | 8080 |
+| **LocalAI** | See [localai.io](https://localai.io) | 8080 |
+
+Auto-detection probes ports in order: Ollama (11434) → LM Studio (1234) → vLLM (8000) → MLX/LocalAI (8080). Set `LOCAL_MODEL_BASE_URL` to skip auto-detection or point to a remote server.
 
 ## Fallback Chains
 
@@ -112,6 +129,11 @@ consult_codex:
 consult_requesty:
   1. Requesty.ai (direct)
   2. { delegateTo: 'claude' }
+
+consult_local:
+  1. Local server (Ollama/LM Studio/vLLM/MLX/LocalAI)
+  2. Requesty.ai (deepseek)
+  3. { delegateTo: 'claude' }
 ```
 
 ## Smart Routing
@@ -138,6 +160,7 @@ Tasks are classified into one of 9 types based on keyword matching:
 | Score | Task Type | Routes To |
 |-------|-----------|-----------|
 | 0-2 | Any | `inline` (handle in Claude) |
+| 3-4 | script, code, docs, refactor, test | `local`* (if server detected) |
 | 3-4 | docs | `gemini-flash` |
 | 3-4 | script | `openrouter` (DeepSeek) |
 | 3-4 | code, refactor | `codex` |
@@ -151,6 +174,8 @@ Tasks are classified into one of 9 types based on keyword matching:
 | 7-8 | code, refactor, test | `codex` (full_auto) |
 | 9-10 | architecture, security | `opus` |
 | 9-10 | research | `gemini-pro` |
+
+\* Local routing rules are only active when a local server is detected at startup. If no server is found, these tasks fall through to the cloud provider rules.
 
 ## Tool Reference
 
@@ -208,6 +233,21 @@ Delegate a task to OpenAI Codex CLI for autonomous execution with its own agent 
 | `sandbox` | string | No | `read-only` (default) or `workspace-write` |
 | `full_auto` | boolean | No | Enable full-auto mode (no approval prompts) |
 | `timeout` | number | No | Timeout in ms (default: 120000, max: 600000) |
+
+### `consult_local`
+
+Consult a locally-running inference server (Ollama, LM Studio, vLLM, MLX, or LocalAI) for zero-cost, low-latency inference.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | string | Yes | The task or question |
+| `model` | string | No | Model name (e.g., `llama3.2`, `codellama`). Use `list_local_models` to see available models. |
+| `context` | string | No | Additional context |
+| `max_tokens` | number | No | Max output tokens (default: 4096) |
+
+### `list_local_models`
+
+List models available on the detected local inference server. Returns model IDs and sizes. Takes no parameters.
 
 ### `list_available_models`
 

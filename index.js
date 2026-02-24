@@ -12,6 +12,8 @@ import { execSync } from 'child_process';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const REQUESTY_API_KEY = process.env.REQUESTY_API_KEY;
+const LOCAL_MODEL_BASE_URL = process.env.LOCAL_MODEL_BASE_URL || null;
+const LOCAL_MODEL_PROVIDER = process.env.LOCAL_MODEL_PROVIDER || null;
 
 const CODEX_AVAILABLE = (() => {
   try {
@@ -30,6 +32,57 @@ const GEMINI_CLI_PATH = (() => {
   return null;
 })();
 const GEMINI_CLI_AVAILABLE = !!GEMINI_CLI_PATH;
+
+const LOCAL_PROVIDER_DEFAULTS = {
+  ollama:   { port: 11434, baseUrl: 'http://127.0.0.1:11434/v1', listUrl: 'http://127.0.0.1:11434/api/tags', name: 'Ollama' },
+  lmstudio: { port: 1234,  baseUrl: 'http://127.0.0.1:1234/v1',  listUrl: 'http://127.0.0.1:1234/v1/models',  name: 'LM Studio' },
+  vllm:     { port: 8000,  baseUrl: 'http://127.0.0.1:8000/v1',  listUrl: 'http://127.0.0.1:8000/v1/models',  name: 'vLLM' },
+  mlx:      { port: 8080,  baseUrl: 'http://127.0.0.1:8080/v1',  listUrl: 'http://127.0.0.1:8080/v1/models',  name: 'MLX' },
+  localai:  { port: 8080,  baseUrl: 'http://127.0.0.1:8080/v1',  listUrl: 'http://127.0.0.1:8080/v1/models',  name: 'LocalAI' },
+};
+
+const LOCAL_SERVER_INFO = await (async () => {
+  const unavailable = { available: false, provider: null, name: null, baseUrl: null, listUrl: null };
+
+  // If user explicitly set a base URL, trust it
+  if (LOCAL_MODEL_BASE_URL) {
+    const provider = LOCAL_MODEL_PROVIDER || 'custom';
+    const defaults = LOCAL_PROVIDER_DEFAULTS[provider];
+    const name = defaults?.name || provider;
+    const listUrl = defaults?.listUrl || `${LOCAL_MODEL_BASE_URL}/models`;
+    return { available: true, provider, name, baseUrl: LOCAL_MODEL_BASE_URL, listUrl };
+  }
+
+  // If user specified a provider hint, only probe that one
+  if (LOCAL_MODEL_PROVIDER && LOCAL_PROVIDER_DEFAULTS[LOCAL_MODEL_PROVIDER]) {
+    const cfg = LOCAL_PROVIDER_DEFAULTS[LOCAL_MODEL_PROVIDER];
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2000);
+      await fetch(cfg.listUrl, { signal: ctrl.signal });
+      clearTimeout(timer);
+      return { available: true, provider: LOCAL_MODEL_PROVIDER, name: cfg.name, baseUrl: cfg.baseUrl, listUrl: cfg.listUrl };
+    } catch {
+      return unavailable;
+    }
+  }
+
+  // Auto-probe default ports in order
+  const probeOrder = ['ollama', 'lmstudio', 'vllm', 'mlx', 'localai'];
+  for (const provider of probeOrder) {
+    const cfg = LOCAL_PROVIDER_DEFAULTS[provider];
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2000);
+      await fetch(cfg.listUrl, { signal: ctrl.signal });
+      clearTimeout(timer);
+      return { available: true, provider, name: cfg.name, baseUrl: cfg.baseUrl, listUrl: cfg.listUrl };
+    } catch {
+      // not running, try next
+    }
+  }
+  return unavailable;
+})();
 
 const OPENROUTER_MODELS = {
   deepseek: "deepseek/deepseek-v3.2",
@@ -182,6 +235,61 @@ async function callRequesty(modelKey, prompt, context, maxTokens) {
   return text;
 }
 
+async function callLocal(model, prompt, context, maxTokens) {
+  if (!LOCAL_SERVER_INFO.available) {
+    throw new Error("No local inference server detected");
+  }
+  const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const apiKey = LOCAL_SERVER_INFO.provider === 'ollama' ? 'ollama' : 'local';
+  const response = await fetch(`${LOCAL_SERVER_INFO.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: model || 'default',
+      messages: [{ role: "user", content: fullPrompt }],
+      max_tokens: maxTokens || 4096,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Local server (${LOCAL_SERVER_INFO.name}) error ${response.status}: ${err}`);
+  }
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) throw new Error(`Unexpected local server response: ${JSON.stringify(data)}`);
+  return text;
+}
+
+async function listLocalModels() {
+  if (!LOCAL_SERVER_INFO.available) return [];
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const response = await fetch(LOCAL_SERVER_INFO.listUrl, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!response.ok) return [];
+    const data = await response.json();
+    // Normalize: OpenAI format (data.data[].id) vs Ollama format (data.models[].name)
+    if (Array.isArray(data.data)) {
+      return data.data.map(m => ({ id: m.id, name: m.id, owned_by: m.owned_by || LOCAL_SERVER_INFO.name }));
+    }
+    if (Array.isArray(data.models)) {
+      return data.models.map(m => ({
+        id: m.name || m.model,
+        name: m.name || m.model,
+        owned_by: LOCAL_SERVER_INFO.name,
+        size: m.size ? `${(m.size / 1e9).toFixed(1)}GB` : undefined,
+      }));
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
 function makeDelegateResponse(prompt, context, failureReason) {
   const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
   return JSON.stringify({
@@ -235,6 +343,21 @@ async function callRequestyWithFallback(modelKey, prompt, context, maxTokens) {
   if (REQUESTY_API_KEY) {
     try {
       return await callRequesty(modelKey, prompt, context, maxTokens);
+    } catch (err) { errors.push(`Requesty: ${err.message}`); }
+  }
+  return makeDelegateResponse(prompt, context, errors.join(' | '));
+}
+
+async function callLocalWithFallback(model, prompt, context, maxTokens) {
+  const errors = [];
+  if (LOCAL_SERVER_INFO.available) {
+    try {
+      return await callLocal(model, prompt, context, maxTokens);
+    } catch (err) { errors.push(`Local(${LOCAL_SERVER_INFO.name}): ${err.message}`); }
+  }
+  if (REQUESTY_API_KEY) {
+    try {
+      return await callRequesty('deepseek', prompt, context, maxTokens);
     } catch (err) { errors.push(`Requesty: ${err.message}`); }
   }
   return makeDelegateResponse(prompt, context, errors.join(' | '));
@@ -369,8 +492,13 @@ function classifyTaskType(description) {
 }
 
 function routeTask(score, taskType) {
+  const localRules = LOCAL_SERVER_INFO.available ? [
+    { maxScore: 4, types: ['script', 'code', 'docs', 'refactor', 'test'], model: 'local', reason: `Low complexity — local (${LOCAL_SERVER_INFO.name})` },
+  ] : [];
+
   const rules = [
     { maxScore: 2, types: '*',                model: 'inline',       reason: 'Trivial — handle inline' },
+    ...localRules,
     { maxScore: 4, types: ['docs'],           model: 'gemini-flash', reason: 'Documentation — Gemini Flash (fast/cheap)' },
     { maxScore: 4, types: ['script'],         model: 'openrouter',   modelKey: 'deepseek', reason: 'Script — DeepSeek' },
     { maxScore: 4, types: ['code', 'refactor'], model: 'codex',      reason: 'Bulk code generation — Codex' },
@@ -492,7 +620,7 @@ function buildExecutionOrder(tasks) {
 }
 
 const server = new Server(
-  { name: "multi-model-router", version: "2.0.0" },
+  { name: "multi-model-router", version: "2.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -649,6 +777,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "consult_local",
+      description:
+        "Consult a locally-running inference server (Ollama, LM Studio, vLLM, MLX, or LocalAI). Zero-cost, low-latency inference for simple tasks. Model names are passed through verbatim — use list_local_models to see available models.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "The task or question for the local model",
+          },
+          model: {
+            type: "string",
+            description: "Model name (e.g. 'llama3.2', 'codellama'). Use list_local_models to see available models.",
+          },
+          context: {
+            type: "string",
+            description: "Optional additional context",
+          },
+          max_tokens: {
+            type: "number",
+            description: "Maximum output tokens (default: 4096)",
+          },
+        },
+        required: ["prompt"],
+      },
+    },
+    {
+      name: "list_local_models",
+      description:
+        "List models available on the detected local inference server (Ollama, LM Studio, vLLM, MLX, or LocalAI). Returns model IDs and sizes.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+    {
       name: "list_available_models",
       description:
         "List all available models and whether their API keys are configured.",
@@ -777,7 +942,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         },
       ];
 
-      const allModels = [...models, ...reqModels, ...codexModels];
+      const localModels = LOCAL_SERVER_INFO.available
+        ? [{
+            name: `Local Inference (${LOCAL_SERVER_INFO.name})`,
+            id: `${LOCAL_SERVER_INFO.provider}@${LOCAL_SERVER_INFO.baseUrl}`,
+            tool: "consult_local / list_local_models",
+            status: `DETECTED (${LOCAL_SERVER_INFO.name} at ${LOCAL_SERVER_INFO.baseUrl})`,
+            bestFor: "Zero-cost, low-latency inference for simple tasks (score 3-4)",
+          }]
+        : [{
+            name: "Local Inference (Ollama / LM Studio / vLLM / MLX / LocalAI)",
+            id: "local-not-detected",
+            tool: "consult_local / list_local_models",
+            status: "NOT DETECTED — install Ollama (ollama.ai), LM Studio, vLLM, MLX, or LocalAI",
+            bestFor: "Zero-cost, low-latency inference for simple tasks (score 3-4)",
+          }];
+
+      const allModels = [...models, ...reqModels, ...codexModels, ...localModels];
       const output = allModels
         .map(
           (m) =>
@@ -847,6 +1028,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       );
       return { content: [{ type: "text", text }] };
+    }
+
+    if (name === "consult_local") {
+      if (!LOCAL_SERVER_INFO.available) {
+        return {
+          content: [{ type: "text", text: `Error: No local inference server detected.\n\nInstall one of:\n- Ollama: curl -fsSL https://ollama.ai/install.sh | sh && ollama pull llama3.2\n- LM Studio: https://lmstudio.ai\n- vLLM: pip install vllm && vllm serve <model>\n- MLX: pip install mlx-lm && mlx_lm.server\n- LocalAI: https://localai.io\n\nOr set LOCAL_MODEL_BASE_URL to your server's OpenAI-compatible endpoint.` }],
+          isError: true,
+        };
+      }
+      const text = await callLocalWithFallback(
+        args.model,
+        args.prompt,
+        args.context,
+        args.max_tokens
+      );
+      return { content: [{ type: "text", text }] };
+    }
+
+    if (name === "list_local_models") {
+      if (!LOCAL_SERVER_INFO.available) {
+        return {
+          content: [{ type: "text", text: "No local inference server detected. Install Ollama, LM Studio, vLLM, MLX, or LocalAI to use local models." }],
+        };
+      }
+      const models = await listLocalModels();
+      if (models.length === 0) {
+        return {
+          content: [{ type: "text", text: `${LOCAL_SERVER_INFO.name} detected at ${LOCAL_SERVER_INFO.baseUrl} but no models found. Pull a model first (e.g., for Ollama: ollama pull llama3.2).` }],
+        };
+      }
+      const output = `**${LOCAL_SERVER_INFO.name}** (${LOCAL_SERVER_INFO.baseUrl})\n\n` +
+        models.map(m => `- **${m.id}**${m.size ? ` (${m.size})` : ''}${m.owned_by ? ` — ${m.owned_by}` : ''}`).join('\n');
+      return { content: [{ type: "text", text: output }] };
     }
 
     if (name === "analyze_requirements") {
@@ -1006,6 +1220,13 @@ ${requirements}
                   break;
                 case 'openrouter':
                   result = { model: task.route.modelKey || 'deepseek', output: await callOpenRouterWithFallback(task.route.modelKey || 'deepseek', taskPrompt, null, 4096) };
+                  break;
+                case 'local':
+                  if (LOCAL_SERVER_INFO.available) {
+                    result = { model: `local(${LOCAL_SERVER_INFO.name})`, output: await callLocalWithFallback(null, taskPrompt, null, 4096) };
+                  } else {
+                    result = { model: 'local', delegateTo: 'claude', prompt: taskPrompt, note: 'Local server unavailable — delegate to Claude' };
+                  }
                   break;
                 case 'codex':
                   if (CODEX_AVAILABLE) {
