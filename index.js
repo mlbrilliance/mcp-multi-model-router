@@ -102,10 +102,10 @@ const OPENROUTER_MODELS = {
 };
 
 const REQUESTY_MODELS = {
-  deepseek: "deepinfra/deepseek-ai/DeepSeek-V3.2",
-  qwen: "deepinfra/Qwen/Qwen3.6-Plus",
-  glm: "novita/zai-org/glm-5-turbo",
-  minimax: "novita/zai-org/glm-5-turbo", // minimax not on Requesty, fallback to GLM
+  deepseek: "fireworks/deepseek-v3.2",
+  qwen: "alibaba/qwen-plus",
+  glm: "zai/GLM-5",
+  minimax: "minimaxi/MiniMax-M2.7",
   "gemini-pro": "google/gemini-3.1-pro-preview",
   "gemini-flash": "google/gemini-3-flash-preview",
 };
@@ -2980,9 +2980,9 @@ if (MMR_HTTP_PORT > 0) {
         { id: 'gemini-pro', name: 'Gemini 3.1 Pro Preview', owned_by: 'google', available: GEMINI_CLI_AVAILABLE || !!GEMINI_API_KEY },
         { id: 'gemini-flash', name: 'Gemini Flash 3', owned_by: 'google', available: GEMINI_CLI_AVAILABLE || !!GEMINI_API_KEY },
         { id: 'deepseek', name: 'DeepSeek V3.2', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
-        { id: 'qwen', name: 'Qwen 3.5', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
-        { id: 'glm', name: 'GLM-5', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
-        { id: 'minimax', name: 'Minimax M2.5', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'qwen', name: 'Qwen 3.6 Plus', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'glm', name: 'GLM-5 Turbo', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'minimax', name: 'Minimax M2.7', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
         { id: 'codex', name: 'Codex CLI (gpt-5.3-codex)', owned_by: 'openai', available: CODEX_AVAILABLE },
         { id: 'copilot', name: 'GitHub Copilot', owned_by: 'github', available: COPILOT_AVAILABLE },
         { id: 'local', name: LOCAL_SERVER_INFO.available ? `Local (${LOCAL_SERVER_INFO.name})` : 'Local (not detected)', owned_by: 'local', available: LOCAL_SERVER_INFO.available },
