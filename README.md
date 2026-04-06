@@ -1,27 +1,92 @@
 # mcp-multi-model-router
 
-MCP server that intelligently routes AI tasks to the optimal model (Gemini, DeepSeek, Codex, OpenRouter, Requesty) using code-based complexity scoring and automatic fallback chains.
+MCP server that intelligently routes AI tasks to the optimal model (Gemini, DeepSeek, Codex, OpenRouter, Requesty, Copilot, local) using code-based complexity scoring, intent classification, agent prompt templates, and automatic fallback chains with circuit breakers.
 
 ## What is this?
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — or any MCP-compatible client — that acts as a unified gateway to multiple LLM providers. Instead of manually choosing which model to call, the router scores task complexity using code-based heuristics and routes to the optimal model automatically.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — or any MCP-compatible client — that acts as a unified gateway to multiple LLM providers. Instead of manually choosing which model to call, the router detects intent, scores complexity, selects a specialized agent template, and routes to the optimal model automatically.
 
 ## Features
 
-- **10 MCP tools** for model consultation, listing, requirements analysis, and plan execution
+- **15 MCP tools** for model consultation, listing, requirements analysis, plan execution, agent templates, and quality stats
+- **Intent classification** with 12+ keyword triggers for fast upfront routing (inspired by oh-my-codex)
+- **13 agent prompt templates** — specialized system prompts with behavioral governance for code-reviewer, security-auditor, debugger, architect, test-engineer, researcher, verifier, etc.
+- **Structured subagent status protocol** — agents report DONE/DONE_WITH_CONCERNS/NEEDS_CONTEXT/BLOCKED instead of free-form responses (inspired by [obra/superpowers](https://github.com/obra/superpowers))
+- **Red flag rationalization guards** — empirically-derived anti-pattern tables in key agent templates (debugger, test-engineer, security-auditor, architect, verifier) that prevent agents from cutting corners (inspired by [obra/superpowers](https://github.com/obra/superpowers))
+- **Two-stage verification** — Ralph Loop verifies spec compliance first, then code quality. Quality issues are advisory, not blocking. (inspired by [obra/superpowers](https://github.com/obra/superpowers))
+- **3-fix escalation** — after 2 consecutive verification failures, automatically escalates to a more capable model via the escalation ladder instead of retrying the same provider (inspired by [obra/superpowers](https://github.com/obra/superpowers))
+- **Verification gate with evidence** — verifiers must cite specific output lines as evidence for verdicts. "Looks good" is not an acceptable verdict.
 - **Code-based complexity scoring (0-10)** using lexical, semantic, scope, and uncertainty features — no LLM calls needed for scoring
-- **Task type classification** into 9 categories: docs, code, test, refactor, script, debug, security, architecture, research
+- **Task type classification** into 10 categories: docs, code, test, refactor, script, debug, security, architecture, research, orchestration
 - **Deterministic routing table** mapping `(complexity score, task type)` to the optimal model
 - **Automatic fallback chains** — every provider chain ends with `delegateTo: 'claude'` so calls never fail to the user
+- **Circuit breaker** (provider health monitoring) — tracks provider failures, skips known-down providers, auto-recovers via half-open probing
+- **Rate limit retry** — on HTTP 429, parses `Retry-After` header and retries (up to 2x, capped at 30s) before falling through to fallback
+- **Reasoning effort control** — `effort` parameter (low/medium/high/xhigh) on all `consult_*` tools adjusts max tokens, complexity score boost, and model tier
+- **Response quality tracking** — tracks success rates and latency per model+taskType, exposed via `router_stats` tool and `/v1/stats` HTTP endpoint
 - **DAG-based task execution** with parallelism for multi-task plans via `analyze_requirements` + `execute_routing_plan`
 - **MCP tool recommendations** — suggests prerequisite tools (Exa, Tavily, Ref, SpacetimeDB) based on task type
+
+## Superpowers-Inspired Behavioral Governance (v3.1.0)
+
+These features are adapted from [obra/superpowers](https://github.com/obra/superpowers), a behavioral governance framework for AI coding agents.
+
+### Subagent Status Protocol
+
+Every agent template now instructs the model to end responses with a structured status:
+
+```
+STATUS: DONE | Task completed successfully
+STATUS: DONE_WITH_CONCERNS | Implemented but found potential memory leak
+STATUS: NEEDS_CONTEXT | Cannot determine correct auth flow without seeing middleware
+STATUS: BLOCKED | Task requires database access not available in current sandbox
+```
+
+The Ralph Loop parses these statuses:
+- **BLOCKED** → triggers automatic model escalation
+- **NEEDS_CONTEXT** → returns early so the controller can provide missing information
+- **DONE_WITH_CONCERNS** → passes verification with concerns forwarded
+
+### Red Flag Rationalization Guards
+
+Key agent templates include empirically-derived "Red Flag" tables that counter common rationalizations agents use to skip rigorous work:
+
+| Agent | Guards Against |
+|-------|---------------|
+| debugger | "I think this fixes it", guessing without evidence, symptom-fixing without root cause |
+| test-engineer | "Too simple to test", skipping edge cases, writing tests-after instead of tests-first |
+| security-auditor | "This is internal-only", trusting framework defaults, dismissing low-severity findings |
+| architect | "We can refactor later", cargo-culting patterns, hand-waving performance claims |
+| verifier | "Looks mostly correct", charitable interpretation, passing incomplete work |
+
+### Two-Stage Verification
+
+The Ralph Loop now runs verification in two stages:
+
+1. **Spec Compliance** — Does the output match what was requested? Must cite specific evidence from the output. This is the gate: if spec fails, retry immediately.
+2. **Quality Check** — Is the output well-built? Only runs if spec passes. Quality issues are reported as advisory, not blocking. Task-specific criteria (e.g., code checks for TODO markers and O(n^2) patterns, tests check for independent assertions).
+
+### Escalation Ladder
+
+After 2 consecutive verification failures, the Ralph Loop automatically escalates to a more capable model:
+
+```
+local → openrouter → gemini-flash → gemini-pro → opus
+openrouter → gemini-flash → gemini-pro → copilot → opus
+gemini-flash → gemini-pro → copilot → opus
+gemini-pro → copilot → opus
+copilot → gemini-pro → opus
+codex → gemini-pro → opus
+```
+
+This prevents wasting iterations retrying a provider that's not capable enough for the task.
 
 ## Supported Providers
 
 | Provider | Models | Best For |
 |----------|--------|----------|
 | **Google Gemini** | Gemini 3.1 Pro Preview, Gemini Flash 3 | Research (1M context), docs, transforms |
-| **OpenRouter** | DeepSeek V3.2, Qwen 3.5, GLM-5, Minimax M2.5 | Scripts, boilerplate, CRUD |
+| **OpenRouter** | DeepSeek V3.2, Qwen 3.6 Plus, GLM-5 Turbo, Minimax M2.7 | Scripts, boilerplate, CRUD |
 | **Requesty.ai** | 300+ models (auto-failover) | Fallback router, direct model access |
 | **OpenAI Codex CLI** | gpt-5.3-codex and variants | Feature impl, refactors, bulk codegen |
 | **Local Inference** | Ollama, LM Studio, vLLM, MLX, LocalAI | Zero-cost, low-latency simple tasks |

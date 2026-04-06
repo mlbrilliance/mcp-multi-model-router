@@ -8,12 +8,18 @@ import {
 
 import { spawn as spawnProcess } from 'child_process';
 import { execSync } from 'child_process';
+import { createRequire } from 'module';
+import { createHash } from 'crypto';
+const require = createRequire(import.meta.url);
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const REQUESTY_API_KEY = process.env.REQUESTY_API_KEY;
+const GITHUB_COPILOT_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || null;
 const LOCAL_MODEL_BASE_URL = process.env.LOCAL_MODEL_BASE_URL || null;
 const LOCAL_MODEL_PROVIDER = process.env.LOCAL_MODEL_PROVIDER || null;
+
+const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY;
 
 const CODEX_AVAILABLE = (() => {
   try {
@@ -67,18 +73,22 @@ const LOCAL_SERVER_INFO = await (async () => {
     }
   }
 
-  // Auto-probe default ports in order
+  // Auto-probe default ports in parallel (priority preserved via probeOrder index)
   const probeOrder = ['ollama', 'lmstudio', 'vllm', 'mlx', 'localai'];
-  for (const provider of probeOrder) {
-    const cfg = LOCAL_PROVIDER_DEFAULTS[provider];
-    try {
+  const probeResults = await Promise.allSettled(
+    probeOrder.map(async (provider) => {
+      const cfg = LOCAL_PROVIDER_DEFAULTS[provider];
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 2000);
       await fetch(cfg.listUrl, { signal: ctrl.signal });
       clearTimeout(timer);
-      return { available: true, provider, name: cfg.name, baseUrl: cfg.baseUrl, listUrl: cfg.listUrl };
-    } catch {
-      // not running, try next
+      return { provider, name: cfg.name, baseUrl: cfg.baseUrl, listUrl: cfg.listUrl };
+    })
+  );
+  for (let i = 0; i < probeOrder.length; i++) {
+    if (probeResults[i].status === 'fulfilled') {
+      const { provider, name, baseUrl, listUrl } = probeResults[i].value;
+      return { available: true, provider, name, baseUrl, listUrl };
     }
   }
   return unavailable;
@@ -86,26 +96,271 @@ const LOCAL_SERVER_INFO = await (async () => {
 
 const OPENROUTER_MODELS = {
   deepseek: "deepseek/deepseek-v3.2",
-  qwen: "qwen/qwen3.5-397b-a17b",
-  glm: "z-ai/glm-5",
-  minimax: "minimax/minimax-m2.5",
+  qwen: "qwen/qwen3.6-plus:free",
+  glm: "z-ai/glm-5-turbo",
+  minimax: "minimax/minimax-m2.7",
 };
 
 const REQUESTY_MODELS = {
-  deepseek: "deepinfra/deepseek-ai/DeepSeek-V3.1",
-  qwen: "deepinfra/Qwen/Qwen3-235B-A22B",
-  glm: "novita/zai-org/glm-4.6",
-  minimax: "novita/zai-org/glm-4.6", // minimax not on Requesty, fallback to GLM
+  deepseek: "deepinfra/deepseek-ai/DeepSeek-V3.2",
+  qwen: "deepinfra/Qwen/Qwen3.6-Plus",
+  glm: "novita/zai-org/glm-5-turbo",
+  minimax: "novita/zai-org/glm-5-turbo", // minimax not on Requesty, fallback to GLM
   "gemini-pro": "google/gemini-3.1-pro-preview",
   "gemini-flash": "google/gemini-3-flash-preview",
 };
 
-async function callGemini(modelName, prompt, context, maxTokens) {
+const COPILOT_MODELS = {
+  "gpt-4.1": "gpt-4.1",
+  "gpt-4.1-mini": "gpt-4.1-mini",
+  "gpt-5.4": "gpt-5.4",
+  "gpt-5.4-mini": "gpt-5.4-mini",
+  "claude-sonnet": "claude-sonnet-4.6",
+  "claude-opus": "claude-opus-4.6",
+  "o4-mini": "o4-mini",
+  "gemini": "gemini-3-flash",
+  "gemini-pro": "gemini-3.1-pro",
+};
+
+const COPILOT_AVAILABLE = !!GITHUB_COPILOT_TOKEN;
+
+const DEFAULT_API_TIMEOUT = parseInt(process.env.MMR_API_TIMEOUT_MS, 10) || 30000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_API_TIMEOUT) {
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (response.status === 429 && attempt < maxRetries) {
+        const retryAfter = parseInt(response.headers.get('retry-after') || '5', 10);
+        const waitMs = Math.min(retryAfter * 1000, 30000);
+        process.stderr.write(`[mmr] 429 from ${new URL(url).hostname}, retrying in ${waitMs}ms\n`);
+        await new Promise(r => setTimeout(r, waitMs));
+        continue;
+      }
+      return response;
+    } catch (err) {
+      clearTimeout(timer);
+      if (attempt < maxRetries && err.name !== 'AbortError') {
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+class LRUCache {
+  constructor(maxSize = 50, ttlMs = 300000) {
+    this.maxSize = maxSize;
+    this.ttlMs = ttlMs;
+    this.cache = new Map();
+  }
+  _key(model, prompt, context) {
+    return createHash('sha256').update(`${model}|${prompt}|${context || ''}`).digest('hex');
+  }
+  get(model, prompt, context) {
+    const key = this._key(model, prompt, context);
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() - entry.ts > this.ttlMs) { this.cache.delete(key); return undefined; }
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+    return entry.value;
+  }
+  set(model, prompt, context, value) {
+    const key = this._key(model, prompt, context);
+    if (this.cache.size >= this.maxSize) {
+      this.cache.delete(this.cache.keys().next().value);
+    }
+    this.cache.set(key, { value, ts: Date.now() });
+  }
+}
+const responseCache = new LRUCache();
+
+// --- Provider Health (Circuit Breaker) ---
+
+class ProviderHealth {
+  constructor(failThreshold = 3, resetMs = 300000) {
+    this.failThreshold = failThreshold;
+    this.resetMs = resetMs;
+    this.providers = {};
+  }
+  _ensure(name) {
+    if (!this.providers[name]) this.providers[name] = { failures: [], state: 'closed', lastCheck: 0 };
+    return this.providers[name];
+  }
+  recordSuccess(name) {
+    const p = this._ensure(name);
+    p.failures = [];
+    p.state = 'closed';
+  }
+  recordFailure(name) {
+    const p = this._ensure(name);
+    p.failures.push(Date.now());
+    p.failures = p.failures.filter(t => Date.now() - t < this.resetMs);
+    if (p.failures.length >= this.failThreshold) p.state = 'open';
+  }
+  isAvailable(name) {
+    const p = this._ensure(name);
+    if (p.state === 'closed') return true;
+    if (p.state === 'open' && Date.now() - p.lastCheck > this.resetMs) {
+      p.state = 'half-open';
+      p.lastCheck = Date.now();
+      return true;
+    }
+    return p.state === 'half-open';
+  }
+  getStatus() {
+    const status = {};
+    for (const [name, p] of Object.entries(this.providers)) {
+      status[name] = { state: p.state, recentFailures: p.failures.length };
+    }
+    return status;
+  }
+}
+const providerHealth = new ProviderHealth();
+
+// --- Response Quality Tracking ---
+
+class QualityTracker {
+  constructor(maxEntries = 1000) {
+    this.maxEntries = maxEntries;
+    this.records = [];
+  }
+  record(model, taskType, success, latencyMs) {
+    this.records.push({ model, taskType, timestamp: Date.now(), success, latencyMs });
+    if (this.records.length > this.maxEntries) this.records.shift();
+  }
+  getStats(model, taskType) {
+    const relevant = this.records.filter(r =>
+      (!model || r.model === model) && (!taskType || r.taskType === taskType)
+    );
+    if (relevant.length === 0) return null;
+    const successes = relevant.filter(r => r.success).length;
+    const avgLatency = relevant.reduce((s, r) => s + r.latencyMs, 0) / relevant.length;
+    return { total: relevant.length, successRate: successes / relevant.length, avgLatencyMs: Math.round(avgLatency) };
+  }
+  getAllStats() {
+    const models = [...new Set(this.records.map(r => r.model))];
+    const taskTypes = [...new Set(this.records.map(r => r.taskType))];
+    const overall = {};
+    for (const m of models) {
+      overall[m] = { overall: this.getStats(m, null) };
+      for (const t of taskTypes) {
+        const s = this.getStats(m, t);
+        if (s) overall[m][t] = s;
+      }
+    }
+    return overall;
+  }
+}
+const qualityTracker = new QualityTracker();
+
+// --- Reasoning Effort Levels ---
+
+const EFFORT_LEVELS = {
+  low:    { maxTokens: 1024,  temperature: 0.3, scoreBoost: -2, modelTier: 'cheap' },
+  medium: { maxTokens: 4096,  temperature: 0.5, scoreBoost: 0,  modelTier: 'default' },
+  high:   { maxTokens: 8192,  temperature: 0.7, scoreBoost: 1,  modelTier: 'default' },
+  xhigh:  { maxTokens: 16384, temperature: 0.8, scoreBoost: 2,  modelTier: 'frontier' },
+};
+
+function applyEffort(effort, maxTokens) {
+  const level = EFFORT_LEVELS[effort] || EFFORT_LEVELS.medium;
+  return { maxTokens: maxTokens || level.maxTokens, scoreBoost: level.scoreBoost, modelTier: level.modelTier };
+}
+
+function formatErrors(errors, maxLen = 500) {
+  const joined = errors.join(' | ');
+  if (joined.length <= maxLen) return joined;
+  return `${errors[0]} | ... (${errors.length - 2} more) | ${errors[errors.length - 1]}`;
+}
+
+async function callCopilot(modelKey, prompt, context, maxTokens, systemPrompt) {
+  if (!GITHUB_COPILOT_TOKEN) {
+    throw new Error("GITHUB_TOKEN / GH_TOKEN not set — needed for GitHub Copilot API");
+  }
+
+  const modelId = COPILOT_MODELS[modelKey] || modelKey || COPILOT_MODELS["gpt-4.1"];
+  const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const messages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    { role: "user", content: fullPrompt },
+  ];
+
+  const response = await fetchWithTimeout("https://api.githubcopilot.com/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GITHUB_COPILOT_TOKEN}`,
+      "Editor-Version": "claude-code/1.0",
+      "Copilot-Integration-Id": "claude-code-multi-model-router",
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages,
+      max_tokens: maxTokens || 4096,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Copilot API error ${response.status}: ${err}`);
+  }
+
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error(`Unexpected Copilot response: ${JSON.stringify(data)}`);
+  }
+  return text;
+}
+
+async function callCopilotWithFallback(modelKey, prompt, context, maxTokens, systemPrompt) {
+  const cached = responseCache.get(`copilot:${modelKey}`, prompt, context);
+  if (cached) return cached;
+  const errors = [];
+  const t0 = Date.now();
+  if (COPILOT_AVAILABLE && providerHealth.isAvailable('copilot')) {
+    try {
+      const result = await callCopilot(modelKey, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`copilot:${modelKey}`, prompt, context, result);
+      providerHealth.recordSuccess('copilot');
+      qualityTracker.record(`copilot:${modelKey}`, null, true, Date.now() - t0);
+      return result;
+    } catch (err) { errors.push(`Copilot: ${err.message}`); providerHealth.recordFailure('copilot'); }
+  }
+  if (OPENROUTER_API_KEY && providerHealth.isAvailable('openrouter')) {
+    try {
+      const result = await callOpenRouter('deepseek', prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`copilot:${modelKey}`, prompt, context, result);
+      providerHealth.recordSuccess('openrouter');
+      return result;
+    } catch (err) { errors.push(`OpenRouter: ${err.message}`); providerHealth.recordFailure('openrouter'); }
+  }
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
+    try {
+      const result = await callRequesty('deepseek', prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`copilot:${modelKey}`, prompt, context, result);
+      providerHealth.recordSuccess('requesty');
+      return result;
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
+  }
+  qualityTracker.record(`copilot:${modelKey}`, null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
+}
+
+async function callGemini(modelName, prompt, context, maxTokens, systemPrompt) {
   if (!GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY not set");
   }
 
-  const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const parts = [systemPrompt, context, prompt].filter(Boolean);
+  const fullPrompt = parts.join('\n\n---\n\n');
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
 
@@ -116,11 +371,11 @@ async function callGemini(modelName, prompt, context, maxTokens) {
     },
   };
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }, 60000);
 
   if (!response.ok) {
     const err = await response.text();
@@ -135,8 +390,9 @@ async function callGemini(modelName, prompt, context, maxTokens) {
   return text;
 }
 
-async function callGeminiCLI(cliModel, prompt, context, maxTokens) {
-  const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+async function callGeminiCLI(cliModel, prompt, context, maxTokens, systemPrompt) {
+  const parts = [systemPrompt, context, prompt].filter(Boolean);
+  const fullPrompt = parts.join('\n\n---\n\n');
   const args = ['-p', fullPrompt, '-m', cliModel || 'auto', '-o', 'json', '-y'];
 
   // Strip GEMINI_API_KEY so CLI uses OAuth instead of API key
@@ -173,15 +429,19 @@ async function callGeminiCLI(cliModel, prompt, context, maxTokens) {
   });
 }
 
-async function callOpenRouter(modelKey, prompt, context, maxTokens) {
+async function callOpenRouter(modelKey, prompt, context, maxTokens, systemPrompt) {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY not set");
   }
 
   const modelId = OPENROUTER_MODELS[modelKey] || OPENROUTER_MODELS.deepseek;
   const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const messages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    { role: "user", content: fullPrompt },
+  ];
 
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const response = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -191,7 +451,7 @@ async function callOpenRouter(modelKey, prompt, context, maxTokens) {
     },
     body: JSON.stringify({
       model: modelId,
-      messages: [{ role: "user", content: fullPrompt }],
+      messages,
       max_tokens: maxTokens || 4096,
     }),
   });
@@ -209,11 +469,15 @@ async function callOpenRouter(modelKey, prompt, context, maxTokens) {
   return text;
 }
 
-async function callRequesty(modelKey, prompt, context, maxTokens) {
+async function callRequesty(modelKey, prompt, context, maxTokens, systemPrompt) {
   if (!REQUESTY_API_KEY) throw new Error("REQUESTY_API_KEY not set");
   const modelId = REQUESTY_MODELS[modelKey] || modelKey;
   const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
-  const response = await fetch("https://router.requesty.ai/v1/chat/completions", {
+  const messages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    { role: "user", content: fullPrompt },
+  ];
+  const response = await fetchWithTimeout("https://router.requesty.ai/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -221,7 +485,7 @@ async function callRequesty(modelKey, prompt, context, maxTokens) {
     },
     body: JSON.stringify({
       model: modelId,
-      messages: [{ role: "user", content: fullPrompt }],
+      messages,
       max_tokens: maxTokens || 4096,
     }),
   });
@@ -235,13 +499,17 @@ async function callRequesty(modelKey, prompt, context, maxTokens) {
   return text;
 }
 
-async function callLocal(model, prompt, context, maxTokens) {
+async function callLocal(model, prompt, context, maxTokens, systemPrompt) {
   if (!LOCAL_SERVER_INFO.available) {
     throw new Error("No local inference server detected");
   }
   const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const messages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    { role: "user", content: fullPrompt },
+  ];
   const apiKey = LOCAL_SERVER_INFO.provider === 'ollama' ? 'ollama' : 'local';
-  const response = await fetch(`${LOCAL_SERVER_INFO.baseUrl}/chat/completions`, {
+  const response = await fetchWithTimeout(`${LOCAL_SERVER_INFO.baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -249,10 +517,10 @@ async function callLocal(model, prompt, context, maxTokens) {
     },
     body: JSON.stringify({
       model: model || 'default',
-      messages: [{ role: "user", content: fullPrompt }],
+      messages,
       max_tokens: maxTokens || 4096,
     }),
-  });
+  }, 15000);
   if (!response.ok) {
     const err = await response.text();
     throw new Error(`Local server (${LOCAL_SERVER_INFO.name}) error ${response.status}: ${err}`);
@@ -300,67 +568,122 @@ function makeDelegateResponse(prompt, context, failureReason) {
   });
 }
 
-async function callOpenRouterWithFallback(modelKey, prompt, context, maxTokens) {
+async function callOpenRouterWithFallback(modelKey, prompt, context, maxTokens, systemPrompt) {
+  const cached = responseCache.get(`openrouter:${modelKey}`, prompt, context);
+  if (cached) return cached;
   const errors = [];
-  if (OPENROUTER_API_KEY) {
+  const t0 = Date.now();
+  if (OPENROUTER_API_KEY && providerHealth.isAvailable('openrouter')) {
     try {
-      return await callOpenRouter(modelKey, prompt, context, maxTokens);
-    } catch (err) { errors.push(`OpenRouter: ${err.message}`); }
+      const result = await callOpenRouter(modelKey, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`openrouter:${modelKey}`, prompt, context, result);
+      providerHealth.recordSuccess('openrouter');
+      qualityTracker.record(`openrouter:${modelKey}`, null, true, Date.now() - t0);
+      return result;
+    } catch (err) {
+      errors.push(`OpenRouter(${modelKey}): ${err.message}`);
+      providerHealth.recordFailure('openrouter');
+      if (modelKey === "glm") {
+        try {
+          const result = await callOpenRouter("minimax", prompt, context, maxTokens, systemPrompt);
+          responseCache.set(`openrouter:${modelKey}`, prompt, context, result);
+          return result;
+        } catch (err2) { errors.push(`OpenRouter(minimax backup): ${err2.message}`); }
+      }
+    }
   }
-  if (REQUESTY_API_KEY) {
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
     try {
       const reqModelKey = modelKey || "deepseek";
-      return await callRequesty(reqModelKey, prompt, context, maxTokens);
-    } catch (err) { errors.push(`Requesty: ${err.message}`); }
+      const result = await callRequesty(reqModelKey, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`openrouter:${modelKey}`, prompt, context, result);
+      providerHealth.recordSuccess('requesty');
+      return result;
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
   }
-  return makeDelegateResponse(prompt, context, errors.join(' | '));
+  qualityTracker.record(`openrouter:${modelKey}`, null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
-async function callGeminiWithFallback(modelName, prompt, context, maxTokens) {
+async function callGeminiWithFallback(modelName, prompt, context, maxTokens, systemPrompt) {
+  const cached = responseCache.get(`gemini:${modelName}`, prompt, context);
+  if (cached) return cached;
   const errors = [];
-  if (GEMINI_CLI_AVAILABLE) {
+  const t0 = Date.now();
+  if (GEMINI_CLI_AVAILABLE && providerHealth.isAvailable('gemini-cli')) {
     try {
       const cliModel = modelName.includes('flash') ? 'flash' : 'pro';
-      return await callGeminiCLI(cliModel, prompt, context, maxTokens);
-    } catch (err) { errors.push(`GeminiCLI: ${err.message}`); }
+      const result = await callGeminiCLI(cliModel, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`gemini:${modelName}`, prompt, context, result);
+      providerHealth.recordSuccess('gemini-cli');
+      qualityTracker.record(`gemini:${modelName}`, null, true, Date.now() - t0);
+      return result;
+    } catch (err) { errors.push(`GeminiCLI: ${err.message}`); providerHealth.recordFailure('gemini-cli'); }
   }
-  if (GEMINI_API_KEY) {
+  if (GEMINI_API_KEY && providerHealth.isAvailable('gemini-api')) {
     try {
-      return await callGemini(modelName, prompt, context, maxTokens);
-    } catch (err) { errors.push(`GeminiAPI: ${err.message}`); }
+      const result = await callGemini(modelName, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`gemini:${modelName}`, prompt, context, result);
+      providerHealth.recordSuccess('gemini-api');
+      qualityTracker.record(`gemini:${modelName}`, null, true, Date.now() - t0);
+      return result;
+    } catch (err) { errors.push(`GeminiAPI: ${err.message}`); providerHealth.recordFailure('gemini-api'); }
   }
-  if (REQUESTY_API_KEY) {
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
     try {
       const reqKey = modelName.includes('flash') ? 'gemini-flash' : 'gemini-pro';
-      return await callRequesty(reqKey, prompt, context, maxTokens);
-    } catch (err) { errors.push(`Requesty: ${err.message}`); }
+      const result = await callRequesty(reqKey, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`gemini:${modelName}`, prompt, context, result);
+      providerHealth.recordSuccess('requesty');
+      return result;
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
   }
-  return makeDelegateResponse(prompt, context, errors.join(' | '));
+  qualityTracker.record(`gemini:${modelName}`, null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
-async function callRequestyWithFallback(modelKey, prompt, context, maxTokens) {
+async function callRequestyWithFallback(modelKey, prompt, context, maxTokens, systemPrompt) {
+  const cached = responseCache.get(`requesty:${modelKey}`, prompt, context);
+  if (cached) return cached;
   const errors = [];
-  if (REQUESTY_API_KEY) {
+  const t0 = Date.now();
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
     try {
-      return await callRequesty(modelKey, prompt, context, maxTokens);
-    } catch (err) { errors.push(`Requesty: ${err.message}`); }
+      const result = await callRequesty(modelKey, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`requesty:${modelKey}`, prompt, context, result);
+      providerHealth.recordSuccess('requesty');
+      qualityTracker.record(`requesty:${modelKey}`, null, true, Date.now() - t0);
+      return result;
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
   }
-  return makeDelegateResponse(prompt, context, errors.join(' | '));
+  qualityTracker.record(`requesty:${modelKey}`, null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
-async function callLocalWithFallback(model, prompt, context, maxTokens) {
+async function callLocalWithFallback(model, prompt, context, maxTokens, systemPrompt) {
+  const cached = responseCache.get(`local:${model}`, prompt, context);
+  if (cached) return cached;
   const errors = [];
-  if (LOCAL_SERVER_INFO.available) {
+  const t0 = Date.now();
+  if (LOCAL_SERVER_INFO.available && providerHealth.isAvailable('local')) {
     try {
-      return await callLocal(model, prompt, context, maxTokens);
-    } catch (err) { errors.push(`Local(${LOCAL_SERVER_INFO.name}): ${err.message}`); }
+      const result = await callLocal(model, prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`local:${model}`, prompt, context, result);
+      providerHealth.recordSuccess('local');
+      qualityTracker.record(`local:${model}`, null, true, Date.now() - t0);
+      return result;
+    } catch (err) { errors.push(`Local(${LOCAL_SERVER_INFO.name}): ${err.message}`); providerHealth.recordFailure('local'); }
   }
-  if (REQUESTY_API_KEY) {
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
     try {
-      return await callRequesty('deepseek', prompt, context, maxTokens);
-    } catch (err) { errors.push(`Requesty: ${err.message}`); }
+      const result = await callRequesty('deepseek', prompt, context, maxTokens, systemPrompt);
+      responseCache.set(`local:${model}`, prompt, context, result);
+      providerHealth.recordSuccess('requesty');
+      return result;
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
   }
-  return makeDelegateResponse(prompt, context, errors.join(' | '));
+  qualityTracker.record(`local:${model}`, null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
 async function callCodex(prompt, context, options = {}) {
@@ -392,17 +715,380 @@ async function callCodex(prompt, context, options = {}) {
 
 async function callCodexWithFallback(prompt, context, options = {}) {
   const errors = [];
-  if (CODEX_AVAILABLE) {
+  const t0 = Date.now();
+  if (CODEX_AVAILABLE && providerHealth.isAvailable('codex')) {
     try {
-      return await callCodex(prompt, context, options);
-    } catch (err) { errors.push(`Codex: ${err.message}`); }
+      const result = await callCodex(prompt, context, options);
+      providerHealth.recordSuccess('codex');
+      qualityTracker.record('codex', null, true, Date.now() - t0);
+      return result;
+    } catch (err) { errors.push(`Codex: ${err.message}`); providerHealth.recordFailure('codex'); }
   }
-  if (REQUESTY_API_KEY) {
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
     try {
-      return await callRequesty('deepseek', prompt, context, options.max_tokens || 4096);
-    } catch (err) { errors.push(`Requesty: ${err.message}`); }
+      const result = await callRequesty('deepseek', prompt, context, options.max_tokens || 4096);
+      providerHealth.recordSuccess('requesty');
+      return result;
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
   }
-  return makeDelegateResponse(prompt, context, errors.join(' | '));
+  qualityTracker.record('codex', null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
+}
+
+// --- Ralph Loop (Persistent Consult with Model-Based Verification) ---
+
+const RALPH_DEFAULTS = { maxIterations: 3, maxMaxIterations: 5, confidenceThreshold: 0.85, defaultEffort: 'high' };
+
+const DEFAULT_VERIFICATION_CRITERIA = {
+  code: 'Output contains syntactically valid, complete code. All functions/classes are fully implemented (no TODOs, placeholders, or ellipsis). Edge cases and error handling are present.',
+  docs: 'Documentation is complete, accurate, and covers all mentioned topics. Examples are correct. No placeholders or TODO markers.',
+  test: 'Tests cover happy path, edge cases, and error conditions. Assertions are specific. Test structure follows arrange-act-assert.',
+  debug: 'Root cause is identified with evidence. Fix addresses root cause, not symptoms. No regressions introduced.',
+  security: 'All identified vulnerabilities have specific remediation steps. Severity ratings provided. No critical issues unaddressed.',
+  architecture: 'Design addresses all stated requirements. Trade-offs explicitly discussed. No obvious scalability or maintainability gaps.',
+  refactor: 'Refactored code preserves existing behavior. No functionality lost. Code is measurably simpler or more maintainable.',
+  script: 'Script handles errors gracefully. Input validation present. Script runs to completion on stated inputs.',
+  research: 'Analysis covers all requested topics. Claims supported by evidence. Competing perspectives acknowledged.',
+};
+
+function pickVerifier(executionProvider) {
+  if (executionProvider && executionProvider.startsWith('gemini')) {
+    if (COPILOT_AVAILABLE) return { provider: 'copilot', model: 'gpt-4.1' };
+    if (OPENROUTER_API_KEY) return { provider: 'openrouter', model: 'deepseek' };
+  }
+  if (GEMINI_CLI_AVAILABLE || GEMINI_API_KEY) return { provider: 'gemini-flash', model: null };
+  if (COPILOT_AVAILABLE) return { provider: 'copilot', model: 'gpt-4.1' };
+  if (OPENROUTER_API_KEY) return { provider: 'openrouter', model: 'deepseek' };
+  if (REQUESTY_API_KEY) return { provider: 'requesty', model: 'deepseek' };
+  return { provider: 'gemini-flash', model: null };
+}
+
+// --- Model Escalation Ladder (inspired by obra/superpowers 3-fix escalation) ---
+// After repeated failures, escalate to more capable models instead of retrying the same one.
+
+const ESCALATION_LADDER = {
+  'local':        ['openrouter', 'gemini-flash', 'gemini-pro', 'opus'],
+  'openrouter':   ['gemini-flash', 'gemini-pro', 'copilot', 'opus'],
+  'gemini-flash': ['gemini-pro', 'copilot', 'opus'],
+  'gemini-pro':   ['copilot', 'opus'],
+  'copilot':      ['gemini-pro', 'opus'],
+  'codex':        ['gemini-pro', 'opus'],
+  'requesty':     ['gemini-pro', 'opus'],
+};
+
+function getEscalationTarget(currentProvider, failCount) {
+  const ladder = ESCALATION_LADDER[currentProvider] || ['gemini-pro', 'opus'];
+  // Pick escalation based on how many failures: index into the ladder
+  const idx = Math.min(failCount - 1, ladder.length - 1);
+  return ladder[idx] || 'opus';
+}
+
+// --- Two-Stage Verification (inspired by obra/superpowers) ---
+// Stage 1: Spec compliance — does the output match what was asked?
+// Stage 2: Quality check — is the output well-built? (only if spec passes)
+
+function buildSpecVerificationPrompt(originalPrompt, context, output, criteria) {
+  return `You are a spec compliance verifier. Your ONLY job is to check whether the output matches what was requested. Do NOT evaluate code quality, style, or best practices — only spec compliance.
+
+The output was produced by another agent. Their self-reported status may be incomplete, inaccurate, or optimistic. You MUST verify everything independently.
+
+## Verification Gate Rules
+- You must cite SPECIFIC lines/sections from the output as evidence for each verdict.
+- "Looks good" or "seems correct" are NOT acceptable verdicts. Name what you checked.
+- If you cannot point to specific evidence that a requirement is met, it is NOT met.
+- Absent evidence of completion = incomplete. Do not give benefit of the doubt.
+
+## Original Task
+${originalPrompt}
+${context ? `\n## Context\n${context}` : ''}
+
+## Spec Compliance Criteria
+${criteria}
+
+## Output to Verify
+---
+${output.slice(0, 12000)}
+---
+
+Return ONLY a JSON object (no markdown fences):
+{"passed":true/false,"confidence":0.0-1.0,"issues":["specific issue with evidence"],"suggestions":["specific fix"],"summary":"one-line verdict with evidence","evidence":["line/section cited for each check"]}
+
+Be strict. Every requirement must have evidence of completion. Missing evidence = failed.`;
+}
+
+function buildQualityVerificationPrompt(originalPrompt, context, output, taskType) {
+  const qualityCriteria = {
+    code: 'No TODO/placeholder/ellipsis markers. Error handling present. No obvious O(n^2) in hot paths. No hardcoded secrets. No unused imports/variables.',
+    test: 'Tests are independent (no shared mutable state). Assertions are specific (not just "truthy"). Edge cases covered. Cleanup/teardown present.',
+    security: 'All findings have specific file:line references. Severity ratings justified. Remediation steps are actionable, not generic.',
+    architecture: 'Trade-offs have quantified costs. Diagrams match text. No hand-waving ("should scale well" without numbers).',
+    debug: 'Root cause has evidence trail. Fix is minimal (doesn\'t refactor unrelated code). Regression test included or noted.',
+    docs: 'Examples are runnable. Parameter types match code. No stale references.',
+    refactor: 'Behavior preserved (no functional changes). Measurably simpler (fewer lines, fewer branches, or fewer dependencies).',
+    script: 'Exit codes meaningful. Errors go to stderr. Idempotent where possible.',
+    research: 'Claims cite sources. Uncertainty flagged. Competing views acknowledged.',
+  };
+  const criteria = qualityCriteria[taskType] || qualityCriteria.code;
+
+  return `You are a quality reviewer. The output already PASSED spec compliance — it does what was asked. Now evaluate whether it is WELL-BUILT.
+
+## Quality Criteria
+${criteria}
+
+## Original Task
+${originalPrompt}
+${context ? `\n## Context\n${context}` : ''}
+
+## Output to Review
+---
+${output.slice(0, 12000)}
+---
+
+Return ONLY a JSON object (no markdown fences):
+{"passed":true/false,"confidence":0.0-1.0,"issues":["quality issue"],"suggestions":["improvement"],"summary":"quality verdict"}
+
+Quality issues should not block a DONE verdict unless they indicate the output will cause real problems. Flag concerns, don't fail on style preferences.`;
+}
+
+function buildRetryPrompt(originalPrompt, previousOutput, verification, iteration) {
+  const issues = verification.issues || [];
+  const suggestions = verification.suggestions || [];
+  return `${originalPrompt}
+
+---
+## Previous Attempt (iteration ${iteration})
+${previousOutput.slice(0, 8000)}
+
+## Verification Feedback
+The previous output did NOT pass verification.${issues.length > 0 ? `\nIssues:\n${issues.map((i, idx) => `${idx + 1}. ${i}`).join('\n')}` : ''}${suggestions.length > 0 ? `\nSuggestions:\n${suggestions.map((s, idx) => `${idx + 1}. ${s}`).join('\n')}` : ''}
+
+Produce a corrected, COMPLETE output that addresses ALL issues. Do not describe fixes — produce the full corrected output.`;
+}
+
+function parseVerification(text) {
+  try {
+    const cleaned = text.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+  } catch {}
+  // Fallback: regex extraction
+  const passed = /passed["']?\s*:\s*true/i.test(text);
+  const confMatch = text.match(/confidence["']?\s*:\s*([\d.]+)/);
+  return { passed, confidence: confMatch ? parseFloat(confMatch[1]) : 0.5, issues: [], suggestions: [], summary: 'Parsed from unstructured response' };
+}
+
+async function callProvider(provider, model, prompt, context, maxTokens, sysPrompt) {
+  switch (provider) {
+    case 'gemini-pro': return await callGeminiWithFallback('gemini-3.1-pro-preview', prompt, context, maxTokens, sysPrompt);
+    case 'gemini-flash': return await callGeminiWithFallback('gemini-3-flash-preview', prompt, context, maxTokens, sysPrompt);
+    case 'openrouter': return await callOpenRouterWithFallback(model || 'deepseek', prompt, context, maxTokens, sysPrompt);
+    case 'copilot': return await callCopilotWithFallback(model || 'gpt-4.1', prompt, context, maxTokens, sysPrompt);
+    case 'codex': return await callCodexWithFallback(prompt, context, { max_tokens: maxTokens });
+    case 'requesty': return await callRequestyWithFallback(model || 'deepseek', prompt, context, maxTokens, sysPrompt);
+    case 'local': return await callLocalWithFallback(model, prompt, context, maxTokens, sysPrompt);
+    default: return await callGeminiWithFallback('gemini-3.1-pro-preview', prompt, context, maxTokens, sysPrompt);
+  }
+}
+
+async function ralphLoop(prompt, context, options = {}) {
+  const maxIter = Math.min(options.maxIterations || RALPH_DEFAULTS.maxIterations, RALPH_DEFAULTS.maxMaxIterations);
+  const effort = options.effort || RALPH_DEFAULTS.defaultEffort;
+  const { maxTokens } = applyEffort(effort);
+
+  // Resolve execution provider
+  let execProvider = options.executeWith || 'auto';
+  let execModel = options.executeModel;
+  if (execProvider === 'auto') {
+    const { score } = scoreComplexity(prompt);
+    const intent = classifyIntent(prompt);
+    const taskType = intent ? intent.taskType : classifyTaskType(prompt);
+    const route = routeTask(score, taskType);
+    execProvider = route.model === 'inline' || route.model === 'opus' ? 'gemini-pro' : route.model;
+    execModel = route.modelKey || execModel;
+  }
+
+  // Resolve verification provider
+  const verifyDefault = pickVerifier(execProvider);
+  const verifyProvider = options.verifyWith || verifyDefault.provider;
+  const verifyModel = options.verifyModel || verifyDefault.model;
+
+  // Resolve criteria
+  const intent = classifyIntent(prompt);
+  const taskType = intent ? intent.taskType : classifyTaskType(prompt);
+  const criteria = options.criteria || DEFAULT_VERIFICATION_CRITERIA[taskType] || DEFAULT_VERIFICATION_CRITERIA.code;
+
+  // Resolve agent template for execution
+  const agentName = options.agentTemplate || (intent ? intent.agent : null);
+  const agent = agentName ? AGENT_TEMPLATES[agentName] : resolveAgentTemplate(taskType, 7);
+  const sysPrompt = agent?.systemPrompt;
+
+  const history = [];
+  let currentPrompt = prompt;
+  let bestOutput = null;
+  let bestConfidence = 0;
+  let consecutiveFailures = 0;
+  let currentExecProvider = execProvider;
+  let escalated = false;
+  const t0 = Date.now();
+
+  for (let i = 1; i <= maxIter; i++) {
+    // --- 3-Fix Escalation (inspired by obra/superpowers) ---
+    // After 2 consecutive failures on the same provider, escalate to a more capable model.
+    // This prevents wasting iterations retrying a provider that's clearly not up to the task.
+    if (consecutiveFailures >= 2 && !escalated) {
+      const escalationTarget = getEscalationTarget(currentExecProvider, consecutiveFailures);
+      history.push({
+        iteration: i,
+        phase: 'escalation',
+        from: currentExecProvider,
+        to: escalationTarget,
+        reason: `${consecutiveFailures} consecutive verification failures — escalating model capability`,
+      });
+      currentExecProvider = escalationTarget;
+      escalated = true;
+    }
+
+    // Execute
+    let output;
+    try {
+      output = await callProvider(currentExecProvider, execModel, currentPrompt, context, maxTokens, sysPrompt);
+    } catch (err) {
+      history.push({ iteration: i, phase: 'execution', error: err.message });
+      consecutiveFailures++;
+      break;
+    }
+
+    // Check for delegate response
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed.delegateTo === 'claude') {
+        history.push({ iteration: i, phase: 'execution', delegated: true });
+        return { output: JSON.stringify(parsed), iterations: i, verified: false, history, totalMs: Date.now() - t0 };
+      }
+    } catch {}
+
+    // Parse subagent status if present (DONE/DONE_WITH_CONCERNS/NEEDS_CONTEXT/BLOCKED)
+    const statusMatch = output.match(/STATUS:\s*(DONE|DONE_WITH_CONCERNS|NEEDS_CONTEXT|BLOCKED)\s*\|/);
+    if (statusMatch) {
+      const agentStatus = statusMatch[1];
+      if (agentStatus === 'BLOCKED') {
+        history.push({ iteration: i, phase: 'execution', agentStatus: 'BLOCKED', note: 'Agent reported BLOCKED — escalating' });
+        const escalationTarget = getEscalationTarget(currentExecProvider, 3);
+        currentExecProvider = escalationTarget;
+        escalated = true;
+        consecutiveFailures++;
+        if (i < maxIter) {
+          currentPrompt = buildRetryPrompt(prompt, output, { issues: ['Agent reported BLOCKED'], suggestions: ['Provide more context or use a different approach'] }, i);
+        }
+        continue;
+      }
+      if (agentStatus === 'NEEDS_CONTEXT') {
+        history.push({ iteration: i, phase: 'execution', agentStatus: 'NEEDS_CONTEXT', output: output.slice(-500) });
+        // Return early — the controller needs to provide more context
+        return { output, iterations: i, verified: false, agentStatus: 'NEEDS_CONTEXT', history, totalMs: Date.now() - t0 };
+      }
+    }
+
+    bestOutput = output;
+
+    // --- Two-Stage Verification (inspired by obra/superpowers) ---
+    // Stage 1: Spec compliance — does output match what was asked?
+    const specVerifyPrompt = buildSpecVerificationPrompt(prompt, context, output, criteria);
+    let specVerification;
+    try {
+      const verifyText = await callProvider(verifyProvider, verifyModel, specVerifyPrompt, null, 2048);
+      specVerification = parseVerification(verifyText);
+    } catch (err) {
+      history.push({ iteration: i, phase: 'spec-verification', error: err.message, note: 'Spec verification failed — returning unverified output' });
+      return { output: bestOutput, iterations: i, verified: false, history, totalMs: Date.now() - t0 };
+    }
+
+    history.push({
+      iteration: i,
+      stage: 'spec',
+      passed: specVerification.passed,
+      confidence: specVerification.confidence,
+      issues: specVerification.issues,
+      evidence: specVerification.evidence,
+      summary: specVerification.summary,
+    });
+
+    // If spec fails, skip quality check — retry with spec feedback
+    if (!specVerification.passed && specVerification.confidence < RALPH_DEFAULTS.confidenceThreshold) {
+      consecutiveFailures++;
+      qualityTracker.record(`ralph:${currentExecProvider}`, taskType, false, Date.now() - t0);
+      if (i < maxIter) {
+        currentPrompt = buildRetryPrompt(prompt, output, specVerification, i);
+      }
+      continue;
+    }
+
+    // Stage 2: Quality check — is the output well-built? (only if spec passed)
+    const qualVerifyPrompt = buildQualityVerificationPrompt(prompt, context, output, taskType);
+    let qualVerification;
+    try {
+      const verifyText = await callProvider(verifyProvider, verifyModel, qualVerifyPrompt, null, 2048);
+      qualVerification = parseVerification(verifyText);
+    } catch (err) {
+      // Quality check failed but spec passed — return as verified with note
+      history.push({ iteration: i, stage: 'quality', error: err.message, note: 'Quality check failed but spec passed' });
+      return { output: bestOutput, iterations: i, verified: true, confidence: specVerification.confidence, history, totalMs: Date.now() - t0 };
+    }
+
+    // Combine confidences: spec is gate, quality adjusts confidence
+    const combinedConfidence = specVerification.confidence * 0.7 + qualVerification.confidence * 0.3;
+
+    if (combinedConfidence > bestConfidence) {
+      bestConfidence = combinedConfidence;
+      bestOutput = output;
+    }
+
+    history.push({
+      iteration: i,
+      stage: 'quality',
+      passed: qualVerification.passed,
+      confidence: qualVerification.confidence,
+      issues: qualVerification.issues,
+      summary: qualVerification.summary,
+    });
+
+    qualityTracker.record(`ralph:${currentExecProvider}`, taskType, specVerification.passed, Date.now() - t0);
+
+    // Spec passed = verified. Quality issues are advisory.
+    if (specVerification.passed) {
+      consecutiveFailures = 0;
+      return {
+        output: bestOutput,
+        iterations: i,
+        verified: true,
+        confidence: combinedConfidence,
+        specPassed: true,
+        qualityPassed: qualVerification.passed,
+        qualityIssues: qualVerification.issues,
+        ...(escalated && { escalatedFrom: execProvider, escalatedTo: currentExecProvider }),
+        history,
+        totalMs: Date.now() - t0,
+      };
+    }
+
+    // Both stages ran but overall not passing — retry
+    consecutiveFailures++;
+    if (i < maxIter) {
+      const mergedIssues = [...(specVerification.issues || []), ...(qualVerification.issues || [])];
+      const mergedSuggestions = [...(specVerification.suggestions || []), ...(qualVerification.suggestions || [])];
+      currentPrompt = buildRetryPrompt(prompt, output, { issues: mergedIssues, suggestions: mergedSuggestions }, i);
+    }
+  }
+
+  return {
+    output: bestOutput,
+    iterations: maxIter,
+    verified: false,
+    confidence: bestConfidence,
+    ...(escalated && { escalatedFrom: execProvider, escalatedTo: currentExecProvider }),
+    history,
+    totalMs: Date.now() - t0,
+  };
 }
 
 // --- Code-Based Smart Routing ---
@@ -425,6 +1111,329 @@ const COMPLEXITY_INDICATORS = {
     'log', 'basic', 'crud', 'boilerplate', 'script', 'template',
   ],
 };
+
+// --- Structured Subagent Status Protocol (inspired by obra/superpowers) ---
+// Every agent must end responses with one of these statuses.
+// This replaces free-form "done" messages with actionable, parseable signals.
+
+const SUBAGENT_STATUS_PROTOCOL = `
+
+## Response Status Protocol
+End EVERY response with exactly one status line in this format:
+STATUS: <status> | <one-line summary>
+
+Valid statuses:
+- DONE — Task fully completed, all requirements met, output verified.
+- DONE_WITH_CONCERNS — Task completed but with caveats the controller should review.
+  Follow with: CONCERNS: <bullet list of specific concerns>
+- NEEDS_CONTEXT — Cannot complete without additional information.
+  Follow with: NEEDED: <bullet list of what's missing and why>
+- BLOCKED — Task cannot be completed at current capability level.
+  Follow with: BLOCKED_BY: <specific reason> and SUGGESTION: <what would unblock>
+
+It is always OK to report NEEDS_CONTEXT or BLOCKED. Bad output is worse than no output.
+Reporting DONE when the work is incomplete is the worst possible outcome.`;
+
+// --- Red Flag Rationalization Guards (inspired by obra/superpowers) ---
+// Empirically-derived anti-patterns that prevent agents from cutting corners.
+// Each table targets specific rationalizations that model pressure-tests revealed.
+
+const RED_FLAGS = {
+  debugger: `
+
+## Red Flags — Do NOT Rationalize These
+| Excuse | Reality |
+|--------|---------|
+| "I think this fixes it" | You must verify with evidence, not intuition. Run the failing case. |
+| "It's probably a race condition" | Name the specific threads/events. "Probably" means you haven't found it yet. |
+| "Let me try a quick fix" | Fixes without root cause understanding create new bugs. Diagnose first. |
+| "The error message says X, so the fix is Y" | Error messages describe symptoms, not causes. Trace the actual code path. |
+| After 3 failed fix attempts | STOP. Question the architecture. Each fix revealing new coupling = systemic issue. |`,
+
+  'test-engineer': `
+
+## Red Flags — Do NOT Rationalize These
+| Excuse | Reality |
+|--------|---------|
+| "Too simple to need tests" | Simple code breaks. The test takes 30 seconds to write. |
+| "I tested it manually" | Manual testing proves it works now. Automated tests prove it keeps working. |
+| "The implementation is the spec" | Tests-after ask "what does this do?" Tests-first ask "what should this do?" |
+| "Mocking that would be too complex" | If it's hard to test, the design needs work. Testing difficulty = design smell. |
+| "100% coverage is overkill" | Cover behavior, not lines. Missing an edge case test is how prod breaks. |`,
+
+  'security-auditor': `
+
+## Red Flags — Do NOT Rationalize These
+| Excuse | Reality |
+|--------|---------|
+| "This is internal-only, security doesn't matter" | Internal services get compromised. Zero trust applies everywhere. |
+| "The framework handles that" | Verify it. Framework defaults are often insecure. Check the actual config. |
+| "Nobody would think to do that" | Attackers think of things developers don't. That's their job. |
+| "We'll add auth later" | "Later" means "after the breach". Security is not a feature to be scheduled. |
+| "It's just a low-severity finding" | Report ALL findings with evidence. The caller decides severity in context. |`,
+
+  verifier: `
+
+## Red Flags — Do NOT Rationalize These
+| Excuse | Reality |
+|--------|---------|
+| "It looks mostly correct" | "Mostly" means it has bugs. Identify them specifically or verify it passes. |
+| "Minor issues, but overall good" | List every issue. The caller decides what's minor. Your job is completeness. |
+| "The approach is sound even if incomplete" | Incomplete work that passes verification wastes everyone's downstream time. |
+| "They probably meant to..." | Verify what exists, not what was intended. Charitable interpretation hides bugs. |`,
+
+  architect: `
+
+## Red Flags — Do NOT Rationalize These
+| Excuse | Reality |
+|--------|---------|
+| "We can refactor later" | Technical debt accrues interest. Design it right or document the cost explicitly. |
+| "This is how everyone does it" | Cargo-culting is not architecture. Justify each decision for THIS system's constraints. |
+| "It's flexible enough" | Flexibility without constraints is complexity. Name the specific change scenarios. |
+| "Performance won't be an issue" | Do the math. Back-of-envelope calculation or it's a guess, not a decision. |`,
+};
+
+// --- Agent Prompt Templates (inspired by OMC/OMX + obra/superpowers behavioral governance) ---
+
+const AGENT_TEMPLATES = {
+  'code-reviewer': {
+    systemPrompt: `You are an expert code reviewer. Focus on correctness, edge cases, performance, and maintainability. Be specific about line-level issues. Flag potential bugs, suggest improvements.
+
+Violating the letter of the rules is violating the spirit of the rules.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'inline',
+    taskTypes: ['code', 'refactor'],
+    complexityRange: [5, 8],
+  },
+  'security-auditor': {
+    systemPrompt: `You are a security auditor. Systematically check for injection, auth bypass, SSRF, data exposure, and supply chain risks. Reference OWASP categories. Provide severity ratings.
+
+Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS['security-auditor']}${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'opus',
+    taskTypes: ['security'],
+    complexityRange: [5, 10],
+  },
+  'doc-writer': {
+    systemPrompt: `You are a technical writer. Write clear, concise documentation with examples. Follow the existing doc style. Include parameter descriptions and return values.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'gemini-flash',
+    taskTypes: ['docs'],
+    complexityRange: [0, 6],
+  },
+  'architect': {
+    systemPrompt: `You are a software architect. Consider scalability, maintainability, separation of concerns, and operational complexity. Justify tradeoffs explicitly. Produce diagrams when helpful.
+
+Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS.architect}${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'opus',
+    taskTypes: ['architecture'],
+    complexityRange: [7, 10],
+  },
+  'test-engineer': {
+    systemPrompt: `You are a test engineer. Write thorough tests covering happy paths, edge cases, error conditions, and boundary values. Structure tests clearly with arrange-act-assert pattern.
+
+Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS['test-engineer']}${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'codex',
+    taskTypes: ['test'],
+    complexityRange: [3, 8],
+  },
+  'debugger': {
+    systemPrompt: `You are a debugging specialist. Systematically isolate the root cause through hypothesis testing. Check recent changes, dependency versions, and environment differences. Provide fix with explanation.
+
+Phase 1: OBSERVE — Read errors, logs, and recent changes. Form hypotheses.
+Phase 2: ISOLATE — Narrow to smallest reproducing case.
+Phase 3: FIX — Address root cause, not symptoms. Verify fix doesn't regress.
+
+If < 3 fix attempts: return to Phase 1, re-analyze with new information.
+If >= 3 fix attempts: STOP. Question the architecture. Pattern indicators of systemic issues:
+  - Each fix reveals new coupling in a different place
+  - Fixes require "massive refactoring" to work
+  - Each fix creates new symptoms elsewhere
+
+Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS.debugger}${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'opus',
+    taskTypes: ['debug'],
+    complexityRange: [5, 10],
+  },
+  'script-writer': {
+    systemPrompt: `You are a shell/scripting expert. Write robust scripts with error handling, input validation, and clear comments. Prefer POSIX compatibility unless bash-specific features are needed.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'openrouter',
+    modelKey: 'deepseek',
+    taskTypes: ['script'],
+    complexityRange: [0, 6],
+  },
+  'researcher': {
+    systemPrompt: `You are a technical researcher. Synthesize information from multiple sources, compare approaches objectively, and cite specific evidence. Flag uncertainty explicitly.
+
+Never claim confidence you don't have. "I don't know" is always acceptable. Distinguish between:
+- What the evidence shows (cite it)
+- What you infer from the evidence (flag it)
+- What you're uncertain about (say so)${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'gemini-pro',
+    taskTypes: ['research'],
+    complexityRange: [5, 10],
+  },
+  'performance-reviewer': {
+    systemPrompt: `You are a performance engineer. Profile bottlenecks, identify O(n^2) patterns, check memory allocations, evaluate caching strategies, and suggest concrete optimizations with expected impact.
+
+Always quantify: "slow" means nothing. "O(n^2) with n=10k entries = ~100M ops" means something.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'opus',
+    taskTypes: ['code', 'refactor'],
+    complexityRange: [7, 10],
+  },
+  'api-reviewer': {
+    systemPrompt: `You are an API design reviewer. Evaluate REST/GraphQL design for consistency, versioning, error responses, pagination, idempotency, and backward compatibility.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'inline',
+    taskTypes: ['code', 'architecture'],
+    complexityRange: [5, 8],
+  },
+  'explorer': {
+    systemPrompt: `You are a codebase explorer. Quickly identify relevant files, symbols, and patterns. Provide concise summaries of code structure and data flow.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'local',
+    taskTypes: ['research', 'code'],
+    complexityRange: [0, 4],
+  },
+  'product-analyst': {
+    systemPrompt: `You are a product analyst. Evaluate features from user impact, technical feasibility, and business value perspectives. Provide structured recommendations with pros/cons.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'gemini-pro',
+    taskTypes: ['research', 'architecture'],
+    complexityRange: [5, 8],
+  },
+  'verifier': {
+    systemPrompt: `You are a strict verification agent. Evaluate outputs against specific criteria. Be thorough but fair. Return structured JSON verdicts. Flag incomplete work, placeholder content, and logical errors.
+
+The output you are verifying was produced by another agent. Their self-reported status may be incomplete, inaccurate, or optimistic. You MUST verify everything independently.
+
+Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS.verifier}${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'gemini-flash',
+    taskTypes: ['code', 'docs', 'test', 'debug', 'security', 'architecture', 'refactor', 'script', 'research'],
+    complexityRange: [0, 10],
+  },
+};
+
+function resolveAgentTemplate(taskType, score) {
+  let best = null, bestScore = -1;
+  for (const [name, tmpl] of Object.entries(AGENT_TEMPLATES)) {
+    if (!tmpl.taskTypes.includes(taskType)) continue;
+    if (score < tmpl.complexityRange[0] || score > tmpl.complexityRange[1]) continue;
+    // Prefer narrower range (more specialized)
+    const rangeWidth = tmpl.complexityRange[1] - tmpl.complexityRange[0];
+    const specificity = 10 - rangeWidth;
+    if (specificity > bestScore) { bestScore = specificity; best = { name, ...tmpl }; }
+  }
+  return best;
+}
+
+// --- Intent Classification (inspired by OMX intent-first routing) ---
+
+const INTENT_TRIGGERS = {
+  'write-tests':       { keywords: ['write test', 'unit test', 'add test', 'test coverage', 'write spec', 'integration test'], taskType: 'test', agent: 'test-engineer' },
+  'fix-bug':           { keywords: ['fix bug', 'fix error', 'fix crash', 'fix failing', 'broken', 'not working'], taskType: 'debug', agent: 'debugger' },
+  'security-review':   { keywords: ['security review', 'vulnerability', 'audit security', 'check for injection', 'owasp', 'penetration'], taskType: 'security', agent: 'security-auditor' },
+  'write-docs':        { keywords: ['write docs', 'add documentation', 'write readme', 'jsdoc', 'docstring', 'api docs'], taskType: 'docs', agent: 'doc-writer' },
+  'code-review':       { keywords: ['code review', 'review this', 'review code', 'check this code', 'review my'], taskType: 'code', agent: 'code-reviewer' },
+  'refactor':          { keywords: ['refactor', 'restructure', 'reorganize', 'clean up code', 'simplify code'], taskType: 'refactor', agent: 'code-reviewer' },
+  'architecture':      { keywords: ['design system', 'architect', 'system design', 'data model', 'schema design', 'design pattern'], taskType: 'architecture', agent: 'architect' },
+  'research':          { keywords: ['research', 'investigate', 'compare option', 'evaluate', 'survey', 'benchmark'], taskType: 'research', agent: 'researcher' },
+  'performance':       { keywords: ['optimize', 'performance', 'slow query', 'latency', 'profil', 'bottleneck', 'memory leak'], taskType: 'code', agent: 'performance-reviewer' },
+  'bash-script':       { keywords: ['bash script', 'shell script', 'write script', 'automation script', 'cron job'], taskType: 'script', agent: 'script-writer' },
+  'api-design':        { keywords: ['api design', 'rest api', 'graphql schema', 'endpoint design', 'api contract'], taskType: 'architecture', agent: 'api-reviewer' },
+  'implement-feature': { keywords: ['implement', 'build feature', 'create feature', 'add feature', 'new feature'], taskType: 'code', agent: 'code-reviewer' },
+};
+
+function classifyIntent(description) {
+  const desc = description.toLowerCase();
+  let bestIntent = null, bestMatches = 0;
+  for (const [intent, config] of Object.entries(INTENT_TRIGGERS)) {
+    const matches = config.keywords.filter(k => desc.includes(k)).length;
+    if (matches > bestMatches) {
+      bestMatches = matches;
+      bestIntent = { intent, taskType: config.taskType, agent: config.agent, confidence: Math.min(1, matches * 0.3) };
+    }
+  }
+  return bestIntent && bestIntent.confidence >= 0.3 ? bestIntent : null;
+}
+
+async function callFirecrawl(action, params) {
+  if (!FIRECRAWL_API_KEY) {
+    throw new Error("FIRECRAWL_API_KEY not set");
+  }
+
+  const baseUrl = 'https://api.firecrawl.dev/v1';
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${FIRECRAWL_API_KEY}`,
+  };
+
+  let url, body;
+  switch (action) {
+    case 'scrape':
+      url = `${baseUrl}/scrape`;
+      body = {
+        url: params.url,
+        formats: params.formats || ['markdown'],
+        ...(params.onlyMainContent !== undefined && { onlyMainContent: params.onlyMainContent }),
+        ...(params.waitFor && { waitFor: params.waitFor }),
+      };
+      break;
+    case 'crawl':
+      url = `${baseUrl}/crawl`;
+      body = {
+        url: params.url,
+        ...(params.limit && { limit: params.limit }),
+        ...(params.maxDepth && { maxDepth: params.maxDepth }),
+        ...(params.includePaths && { includePaths: params.includePaths }),
+        ...(params.excludePaths && { excludePaths: params.excludePaths }),
+      };
+      break;
+    case 'map':
+      url = `${baseUrl}/map`;
+      body = {
+        url: params.url,
+        ...(params.search && { search: params.search }),
+        ...(params.limit && { limit: params.limit }),
+      };
+      break;
+    case 'search':
+      url = `${baseUrl}/search`;
+      body = {
+        query: params.query,
+        ...(params.limit && { limit: params.limit }),
+        ...(params.lang && { lang: params.lang }),
+        ...(params.country && { country: params.country }),
+        ...(params.scrapeOptions && { scrapeOptions: params.scrapeOptions }),
+      };
+      break;
+    default:
+      throw new Error(`Unknown firecrawl action: ${action}. Use scrape, crawl, map, or search.`);
+  }
+
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Firecrawl API error ${response.status}: ${err}`);
+  }
+
+  const data = await response.json();
+
+  // For crawl, it returns a job ID — poll for completion
+  if (action === 'crawl' && data.id) {
+    const pollUrl = `${baseUrl}/crawl/${data.id}`;
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      const pollResp = await fetch(pollUrl, { headers: { 'Authorization': `Bearer ${FIRECRAWL_API_KEY}` } });
+      if (!pollResp.ok) continue;
+      const pollData = await pollResp.json();
+      if (pollData.status === 'completed') return pollData;
+      if (pollData.status === 'failed') throw new Error(`Crawl failed: ${JSON.stringify(pollData)}`);
+    }
+    throw new Error('Crawl timed out after 60 seconds');
+  }
+
+  return data;
+}
 
 function scoreComplexity(description) {
   const desc = description.toLowerCase();
@@ -459,7 +1468,7 @@ function scoreComplexity(description) {
     /figure out/i, /unclear/i, /debug/i, /strange/i, /error/i, /bug/i, /problem/i];
   const uncertainty = Math.min(1, uncertainPatterns.filter(p => p.test(desc)).length * 0.2);
 
-  // Weighted combination (mirrors claude-flow model-router.ts:272-277)
+  // Weighted combination
   const normalized = Math.min(1, Math.max(0,
     lexical * 0.2 + semantic * 0.35 + scope * 0.25 + uncertainty * 0.2
   ));
@@ -481,6 +1490,7 @@ function classifyTaskType(description) {
     security:     ['security', 'auth', 'encrypt', 'vulnerability', 'injection', 'xss', 'csrf'],
     architecture: ['architect', 'design', 'system', 'pattern', 'migration', 'infrastructure', 'schema'],
     research:     ['research', 'investigate', 'compare', 'evaluate', 'analyze', 'explore', 'survey'],
+    orchestration: ['multi-agent', 'governance', 'budget', 'company', 'approval gate', 'org chart', 'hire agent', 'paperclip', 'orchestrate', 'fleet', 'heartbeat'],
   };
 
   let bestType = 'code', bestScore = 0;
@@ -512,8 +1522,10 @@ function routeTask(score, taskType) {
     { maxScore: 8, types: ['research'],       model: 'gemini-pro',   reason: 'Deep research — Gemini Pro' },
     { maxScore: 8, types: ['code', 'refactor', 'test'], model: 'codex', sandbox: 'workspace-write', fullAuto: true,
       reason: 'Complex multi-file — Codex (full_auto)' },
+    { maxScore: 8,  types: ['orchestration'], model: 'opus',         reason: 'Multi-agent orchestration — Opus' },
     { maxScore: 10, types: ['architecture', 'security'], model: 'opus', reason: 'Expert architecture/security — Opus' },
     { maxScore: 10, types: ['research'],      model: 'gemini-pro',   reason: 'Expert research — Gemini Pro' },
+    { maxScore: 10, types: ['orchestration'], model: 'opus',         reason: 'Expert orchestration — Opus' },
   ];
 
   for (const rule of rules) {
@@ -531,6 +1543,7 @@ const MCP_TOOL_RECOMMENDATIONS = {
     { server: 'exa', tool: 'web_search_exa', when: 'Task needs current web info, recent APIs, library versions' },
     { server: 'tavily', tool: 'tavily-search', when: 'Broad web search for general info, news, comparisons' },
     { server: 'tavily', tool: 'tavily-extract', when: 'Extract structured content from reference URLs' },
+    { server: 'firecrawl', tool: 'consult_firecrawl', when: 'Need to scrape full page content or crawl documentation sites' },
     { server: 'Ref', tool: 'ref_search_documentation', when: 'Task references specific library/framework docs' },
   ],
   debug: [
@@ -559,6 +1572,12 @@ const MCP_TOOL_RECOMMENDATIONS = {
     { server: 'Ref', tool: 'ref_search_documentation', when: 'Reference existing API docs to ensure accuracy' },
     { server: 'tavily', tool: 'tavily-extract', when: 'Extract content from reference URLs for documentation' },
   ],
+  orchestration: [
+    { server: 'paperclip', tool: 'pc_company_status', when: 'Check current agent company status before planning' },
+    { server: 'paperclip', tool: 'pc_task_create', when: 'Create governed task for agent assignment' },
+    { server: 'paperclip', tool: 'pc_agent_list', when: 'Check available agents before task assignment' },
+    { server: 'ntm', tool: 'ntm_spawn', when: 'Need to spawn new agent processes for the task' },
+  ],
 };
 
 function recommendMCPTools(taskType, description) {
@@ -572,6 +1591,10 @@ function recommendMCPTools(taskType, description) {
   }
   if (/\b(extract\s+(from|data|content|info)|scrape|crawl|page\s+content|web\s+page|url\s+content|fetch\s+(page|url|content))\b/.test(desc)) {
     extras.push({ server: 'tavily', tool: 'tavily-extract', when: 'Extract structured content from web pages/URLs' });
+    extras.push({ server: 'firecrawl', tool: 'consult_firecrawl', when: 'Scrape/crawl web pages for full markdown content' });
+  }
+  if (/\b(site\s+map|discover\s+urls|crawl\s+site|full\s+site|all\s+pages|documentation\s+site|docs\s+site)\b/.test(desc)) {
+    extras.push({ server: 'firecrawl', tool: 'consult_firecrawl', when: 'Map or crawl entire site for URLs/content' });
   }
   if (/\b(deep\s+research|thorough\s+search|comprehensive\s+search|search\s+everywhere|find\s+all)\b/.test(desc)) {
     extras.push({ server: 'exa', tool: 'web_search_exa', when: 'Semantic/technical search for deep research' });
@@ -620,7 +1643,7 @@ function buildExecutionOrder(tasks) {
 }
 
 const server = new Server(
-  { name: "multi-model-router", version: "2.1.0" },
+  { name: "multi-model-router", version: "3.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -645,6 +1668,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Maximum output tokens (default: 8192)",
           },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
+          },
         },
         required: ["prompt"],
       },
@@ -667,6 +1695,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           max_tokens: {
             type: "number",
             description: "Maximum output tokens (default: 4096)",
+          },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
           },
         },
         required: ["prompt"],
@@ -696,6 +1729,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Maximum output tokens (default: 4096)",
           },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
+          },
         },
         required: ["prompt"],
       },
@@ -724,6 +1762,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Maximum output tokens (default: 4096)",
           },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
+          },
         },
         required: ["prompt"],
       },
@@ -745,19 +1788,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           model: {
             type: "string",
-            description: "Codex model to use (default: gpt-5.3-codex). See https://developers.openai.com/codex/models/",
-            enum: [
-              "gpt-5.3-codex",
-              "gpt-5.3-codex-spark",
-              "gpt-5.2-codex",
-              "gpt-5.2",
-              "gpt-5.1-codex-max",
-              "gpt-5.1-codex",
-              "gpt-5.1",
-              "gpt-5-codex",
-              "gpt-5-codex-mini",
-              "gpt-5"
-            ],
+            description: "Codex model to use (default: gpt-5.3-codex). Any valid Codex model name accepted.",
           },
           sandbox: {
             type: "string",
@@ -771,6 +1802,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           timeout: {
             type: "number",
             description: "Execution timeout in ms (default 120000 = 2 min, max 600000 = 10 min)",
+          },
+        },
+        required: ["prompt"],
+      },
+    },
+    {
+      name: "consult_copilot",
+      description:
+        "Consult GitHub Copilot API. Access GPT-5.4, GPT-4.1, Claude Sonnet 4.6, Claude Opus 4.6, o4-mini, and Gemini 3 Flash/Pro through GitHub's Copilot infrastructure. Requires GITHUB_TOKEN or GH_TOKEN. Best for: code completion, code review, quick code tasks using GitHub-hosted models.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "The task or question",
+          },
+          model: {
+            type: "string",
+            description: "Copilot model to use (default: gpt-4.1)",
+            enum: [
+              "gpt-4.1",
+              "gpt-4.1-mini",
+              "gpt-5.4",
+              "gpt-5.4-mini",
+              "claude-sonnet",
+              "claude-opus",
+              "o4-mini",
+              "gemini",
+              "gemini-pro",
+            ],
+          },
+          context: {
+            type: "string",
+            description: "Optional additional context (code, file contents)",
+          },
+          max_tokens: {
+            type: "number",
+            description: "Maximum output tokens (default: 4096)",
+          },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
           },
         },
         required: ["prompt"],
@@ -799,8 +1873,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "Maximum output tokens (default: 4096)",
           },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
+          },
         },
         required: ["prompt"],
+      },
+    },
+    {
+      name: "consult_firecrawl",
+      description:
+        "Use Firecrawl to scrape, crawl, map, or search web content. Actions: 'scrape' (single URL to markdown), 'crawl' (multi-page site crawl), 'map' (discover URLs on a site), 'search' (web search with full page content). Returns clean markdown content from web pages.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["scrape", "crawl", "map", "search"],
+            description: "The Firecrawl action: scrape (single page), crawl (multi-page), map (discover URLs), search (web search)",
+          },
+          url: {
+            type: "string",
+            description: "URL to scrape, crawl, or map (required for scrape/crawl/map)",
+          },
+          query: {
+            type: "string",
+            description: "Search query (required for search action)",
+          },
+          limit: {
+            type: "number",
+            description: "Max pages to crawl/return (default: 10 for crawl, 5 for search/map)",
+          },
+          max_depth: {
+            type: "number",
+            description: "Max crawl depth (default: 2, for crawl action only)",
+          },
+          formats: {
+            type: "array",
+            items: { type: "string" },
+            description: "Output formats for scrape: ['markdown'], ['html'], ['markdown', 'html'] (default: ['markdown'])",
+          },
+          include_paths: {
+            type: "array",
+            items: { type: "string" },
+            description: "URL path patterns to include during crawl (e.g., ['/docs/*'])",
+          },
+          exclude_paths: {
+            type: "array",
+            items: { type: "string" },
+            description: "URL path patterns to exclude during crawl (e.g., ['/blog/*'])",
+          },
+          search_query: {
+            type: "string",
+            description: "Filter URLs containing this search term (for map action)",
+          },
+        },
+        required: ["action"],
       },
     },
     {
@@ -857,6 +1987,120 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["plan"],
       },
     },
+    {
+      name: "bead_orchestrate",
+      description:
+        "Agent Flywheel bead orchestration: decomposes requirements into beads (self-contained work units), scores complexity, routes to optimal models, and optionally creates Paperclip governance tasks for each bead. Returns a bead execution plan with task IDs.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          requirements: {
+            type: "string",
+            description: "Requirements to decompose into beads",
+          },
+          context: {
+            type: "string",
+            description: "Additional context (existing code, architecture notes)",
+          },
+          governance: {
+            type: "boolean",
+            description: "Create Paperclip governance tasks for each bead (default: true)",
+          },
+          budget_limit_cents: {
+            type: "number",
+            description: "Maximum budget in cents for this bead set",
+          },
+          project_name: {
+            type: "string",
+            description: "Project name for Paperclip company (default: 'flywheel')",
+          },
+        },
+        required: ["requirements"],
+      },
+    },
+    {
+      name: "list_agent_templates",
+      description:
+        "List all available agent prompt templates with their roles, system prompts, preferred models, and task type mappings. Useful for understanding how the router specializes prompts for different task types.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+    {
+      name: "router_stats",
+      description:
+        "Get response quality statistics and provider health status. Shows success rates, latency, and circuit breaker states for all providers. Use to monitor router performance and diagnose provider issues.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          model: {
+            type: "string",
+            description: "Filter stats to a specific model/provider (optional)",
+          },
+          task_type: {
+            type: "string",
+            description: "Filter stats to a specific task type (optional)",
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "persistent_consult",
+      description:
+        "Ralph loop: persistent task execution with model-based verification. Executes task with one model, verifies output with a different model, retries with critique feedback until verification passes or max iterations reached. Use for tasks where correctness matters more than speed. 'The boulder never stops.'",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "The task to execute persistently",
+          },
+          context: {
+            type: "string",
+            description: "Optional additional context (code, requirements, existing output to improve)",
+          },
+          execute_with: {
+            type: "string",
+            enum: ["gemini-pro", "gemini-flash", "openrouter", "copilot", "codex", "requesty", "local", "auto"],
+            description: "Model/provider for execution (default: auto-routed based on complexity)",
+          },
+          execute_model: {
+            type: "string",
+            description: "Specific model key for execution provider (e.g., 'deepseek', 'qwen', 'gpt-4.1')",
+          },
+          verify_with: {
+            type: "string",
+            enum: ["gemini-pro", "gemini-flash", "openrouter", "copilot", "requesty", "local"],
+            description: "Model/provider for verification (default: auto-selected, different from executor)",
+          },
+          verify_model: {
+            type: "string",
+            description: "Specific model key for verification provider",
+          },
+          verification_criteria: {
+            type: "string",
+            description: "Custom criteria for what 'done' looks like. If omitted, inferred from task type.",
+          },
+          max_iterations: {
+            type: "number",
+            description: "Maximum execute-verify cycles (default: 3, max: 5)",
+          },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level (default: high — Ralph tasks are inherently high-effort)",
+          },
+          agent_template: {
+            type: "string",
+            description: "Force a specific agent template (e.g., 'code-reviewer', 'architect'). If omitted, auto-detected.",
+          },
+        },
+        required: ["prompt"],
+      },
+    },
   ],
 }));
 
@@ -900,21 +2144,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           bestFor: "Bash scripts, boilerplate, simple CRUD, repetitive code",
         },
         {
-          name: "Qwen 3.5 Plus",
+          name: "Qwen 3.6 Plus",
           id: OPENROUTER_MODELS.qwen,
           tool: "consult_openrouter (model='qwen')",
           status: OPENROUTER_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
           bestFor: "Code generation, multilingual tasks",
         },
         {
-          name: "GLM-5",
+          name: "GLM-5 Turbo",
           id: OPENROUTER_MODELS.glm,
           tool: "consult_openrouter (model='glm')",
           status: OPENROUTER_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
           bestFor: "General code tasks",
         },
         {
-          name: "Minimax M2.5",
+          name: "Minimax M2.7",
           id: OPENROUTER_MODELS.minimax,
           tool: "consult_openrouter (model='minimax')",
           status: OPENROUTER_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
@@ -942,6 +2186,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         },
       ];
 
+      const copilotModels = [
+        {
+          name: "GitHub Copilot (GPT-5.4)",
+          id: "copilot/gpt-5.4",
+          tool: "consult_copilot (model='gpt-5.4')",
+          status: COPILOT_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (set GITHUB_TOKEN or GH_TOKEN)",
+          bestFor: "Latest GPT model — code generation, complex reasoning via GitHub Copilot",
+        },
+        {
+          name: "GitHub Copilot (GPT-4.1)",
+          id: "copilot/gpt-4.1",
+          tool: "consult_copilot (model='gpt-4.1')",
+          status: COPILOT_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (set GITHUB_TOKEN or GH_TOKEN)",
+          bestFor: "Advanced code generation, complex reasoning via GitHub Copilot",
+        },
+        {
+          name: "GitHub Copilot (Claude Sonnet 4.6)",
+          id: "copilot/claude-sonnet",
+          tool: "consult_copilot (model='claude-sonnet')",
+          status: COPILOT_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (set GITHUB_TOKEN or GH_TOKEN)",
+          bestFor: "Claude Sonnet via GitHub's infrastructure — alternative routing path",
+        },
+        {
+          name: "GitHub Copilot (Claude Opus 4.6)",
+          id: "copilot/claude-opus",
+          tool: "consult_copilot (model='claude-opus')",
+          status: COPILOT_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (set GITHUB_TOKEN or GH_TOKEN)",
+          bestFor: "Claude Opus via GitHub's infrastructure — highest capability",
+        },
+        {
+          name: "GitHub Copilot (o4-mini)",
+          id: "copilot/o4-mini",
+          tool: "consult_copilot (model='o4-mini')",
+          status: COPILOT_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (set GITHUB_TOKEN or GH_TOKEN)",
+          bestFor: "Reasoning-heavy tasks via GitHub Copilot",
+        },
+      ];
+
       const localModels = LOCAL_SERVER_INFO.available
         ? [{
             name: `Local Inference (${LOCAL_SERVER_INFO.name})`,
@@ -958,7 +2240,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             bestFor: "Zero-cost, low-latency inference for simple tasks (score 3-4)",
           }];
 
-      const allModels = [...models, ...reqModels, ...codexModels, ...localModels];
+      const firecrawlModels = [{
+            name: "Firecrawl (Web Scraping & Crawling)",
+            id: "firecrawl-api",
+            tool: "consult_firecrawl",
+            status: FIRECRAWL_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no FIRECRAWL_API_KEY)",
+            bestFor: "Web scraping, site crawling, URL mapping, web search with full page content as markdown",
+          }];
+
+      const allModels = [...models, ...reqModels, ...codexModels, ...copilotModels, ...localModels, ...firecrawlModels];
+      const health = providerHealth.getStatus();
       const output = allModels
         .map(
           (m) =>
@@ -966,45 +2257,99 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         )
         .join("\n\n");
 
+      const healthOutput = Object.keys(health).length > 0
+        ? '\n\n---\n**Provider Health (Circuit Breaker)**\n' + Object.entries(health).map(([name, h]) =>
+            `- ${name}: ${h.state} (${h.recentFailures} recent failures)`).join('\n')
+        : '';
+
+      return { content: [{ type: "text", text: output + healthOutput }] };
+    }
+
+    if (name === "list_agent_templates") {
+      const output = Object.entries(AGENT_TEMPLATES).map(([name, tmpl]) =>
+        `**${name}**\n  System prompt: ${tmpl.systemPrompt.slice(0, 100)}...\n  Preferred model: ${tmpl.preferredModel}\n  Task types: ${tmpl.taskTypes.join(', ')}\n  Complexity range: ${tmpl.complexityRange[0]}-${tmpl.complexityRange[1]}`
+      ).join('\n\n');
+      return { content: [{ type: "text", text: `## Agent Templates (${Object.keys(AGENT_TEMPLATES).length})\n\n${output}` }] };
+    }
+
+    if (name === "router_stats") {
+      const health = providerHealth.getStatus();
+      const stats = args.model || args.task_type
+        ? { [args.model || 'all']: qualityTracker.getStats(args.model, args.task_type) }
+        : qualityTracker.getAllStats();
+
+      let output = '## Router Stats\n\n### Provider Health\n';
+      if (Object.keys(health).length === 0) {
+        output += 'No provider data yet (no calls made).\n';
+      } else {
+        for (const [name, h] of Object.entries(health)) {
+          output += `- **${name}**: ${h.state} (${h.recentFailures} recent failures)\n`;
+        }
+      }
+
+      output += '\n### Quality Tracking\n';
+      if (Object.keys(stats).length === 0) {
+        output += 'No quality data yet.\n';
+      } else {
+        for (const [model, data] of Object.entries(stats)) {
+          if (!data) continue;
+          if (data.total !== undefined) {
+            output += `- **${model}**: ${(data.successRate * 100).toFixed(0)}% success (${data.total} calls, avg ${data.avgLatencyMs}ms)\n`;
+          } else {
+            output += `\n**${model}**:\n`;
+            for (const [key, s] of Object.entries(data)) {
+              if (s) output += `  - ${key}: ${(s.successRate * 100).toFixed(0)}% success (${s.total} calls, avg ${s.avgLatencyMs}ms)\n`;
+            }
+          }
+        }
+      }
+
+      output += `\n### Effort Levels\n`;
+      for (const [level, cfg] of Object.entries(EFFORT_LEVELS)) {
+        output += `- **${level}**: maxTokens=${cfg.maxTokens}, scoreBoost=${cfg.scoreBoost > 0 ? '+' : ''}${cfg.scoreBoost}, tier=${cfg.modelTier}\n`;
+      }
+
       return { content: [{ type: "text", text: output }] };
     }
 
     if (name === "consult_gemini_pro") {
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens);
+      const template = resolveAgentTemplate('research', 7);
       const text = await callGeminiWithFallback(
-        "gemini-3.1-pro-preview",
-        args.prompt,
-        args.context,
-        args.max_tokens
+        "gemini-3.1-pro-preview", args.prompt, args.context, maxTokens,
+        template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
     }
 
     if (name === "consult_gemini_flash") {
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens || 4096);
+      const template = resolveAgentTemplate('docs', 3);
       const text = await callGeminiWithFallback(
-        "gemini-3-flash-preview",
-        args.prompt,
-        args.context,
-        args.max_tokens || 4096
+        "gemini-3-flash-preview", args.prompt, args.context, maxTokens,
+        template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
     }
 
     if (name === "consult_openrouter") {
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens);
+      const intent = classifyIntent(args.prompt);
+      const template = intent ? AGENT_TEMPLATES[intent.agent] : resolveAgentTemplate('script', 3);
       const text = await callOpenRouterWithFallback(
-        args.model || "deepseek",
-        args.prompt,
-        args.context,
-        args.max_tokens
+        args.model || "deepseek", args.prompt, args.context, maxTokens,
+        template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
     }
 
     if (name === "consult_requesty") {
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens);
+      const intent = classifyIntent(args.prompt);
+      const template = intent ? AGENT_TEMPLATES[intent.agent] : null;
       const text = await callRequestyWithFallback(
-        args.model || "deepseek",
-        args.prompt,
-        args.context,
-        args.max_tokens
+        args.model || "deepseek", args.prompt, args.context, maxTokens,
+        template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
     }
@@ -1016,16 +2361,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           isError: true,
         };
       }
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens);
       const text = await callCodexWithFallback(
-        args.prompt,
-        args.context,
-        {
-          model: args.model,
-          sandbox: args.sandbox,
-          fullAuto: args.full_auto,
-          timeout: args.timeout,
-          max_tokens: args.max_tokens,
-        }
+        args.prompt, args.context,
+        { model: args.model, sandbox: args.sandbox, fullAuto: args.full_auto, timeout: args.timeout, max_tokens: maxTokens }
+      );
+      return { content: [{ type: "text", text }] };
+    }
+
+    if (name === "consult_copilot") {
+      if (!COPILOT_AVAILABLE) {
+        return {
+          content: [{ type: "text", text: "Error: GITHUB_TOKEN or GH_TOKEN not set. Run: gh auth login, then export GH_TOKEN=$(gh auth token)" }],
+          isError: true,
+        };
+      }
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens);
+      const intent = classifyIntent(args.prompt);
+      const template = intent ? AGENT_TEMPLATES[intent.agent] : null;
+      const text = await callCopilotWithFallback(
+        args.model || "gpt-4.1", args.prompt, args.context, maxTokens,
+        template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
     }
@@ -1037,13 +2393,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           isError: true,
         };
       }
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens);
+      const intent = classifyIntent(args.prompt);
+      const template = intent ? AGENT_TEMPLATES[intent.agent] : null;
       const text = await callLocalWithFallback(
-        args.model,
-        args.prompt,
-        args.context,
-        args.max_tokens
+        args.model, args.prompt, args.context, maxTokens,
+        template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
+    }
+
+    if (name === "consult_firecrawl") {
+      if (!FIRECRAWL_API_KEY) {
+        return {
+          content: [{ type: "text", text: "Error: FIRECRAWL_API_KEY not set. Get one at https://firecrawl.dev" }],
+          isError: true,
+        };
+      }
+      const params = {};
+      if (args.url) params.url = args.url;
+      if (args.query) params.query = args.query;
+      if (args.limit) params.limit = args.limit;
+      if (args.max_depth) params.maxDepth = args.max_depth;
+      if (args.formats) params.formats = args.formats;
+      if (args.include_paths) params.includePaths = args.include_paths;
+      if (args.exclude_paths) params.excludePaths = args.exclude_paths;
+      if (args.search_query) params.search = args.search_query;
+
+      const result = await callFirecrawl(args.action, params);
+
+      // Format output based on action
+      let output;
+      if (args.action === 'scrape') {
+        output = result.data?.markdown || result.data?.html || JSON.stringify(result.data);
+      } else if (args.action === 'search') {
+        const items = result.data || [];
+        output = items.map((item, i) => `### ${i + 1}. ${item.title || item.url}\n${item.url}\n\n${(item.markdown || item.description || '').slice(0, 2000)}`).join('\n\n---\n\n');
+      } else if (args.action === 'map') {
+        const links = result.links || result.data || [];
+        output = `Found ${links.length} URLs:\n\n${(Array.isArray(links) ? links : []).map(l => typeof l === 'string' ? `- ${l}` : `- ${l.url || JSON.stringify(l)}`).join('\n')}`;
+      } else if (args.action === 'crawl') {
+        const pages = result.data || [];
+        output = `Crawled ${pages.length} pages:\n\n${pages.map((p, i) => `### Page ${i + 1}: ${p.metadata?.title || p.url || 'Unknown'}\n${(p.markdown || '').slice(0, 1500)}`).join('\n\n---\n\n')}`;
+      } else {
+        output = JSON.stringify(result, null, 2);
+      }
+
+      return { content: [{ type: "text", text: output }] };
     }
 
     if (name === "list_local_models") {
@@ -1061,6 +2457,65 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const output = `**${LOCAL_SERVER_INFO.name}** (${LOCAL_SERVER_INFO.baseUrl})\n\n` +
         models.map(m => `- **${m.id}**${m.size ? ` (${m.size})` : ''}${m.owned_by ? ` — ${m.owned_by}` : ''}`).join('\n');
       return { content: [{ type: "text", text: output }] };
+    }
+
+    if (name === "persistent_consult") {
+      const result = await ralphLoop(args.prompt, args.context, {
+        executeWith: args.execute_with,
+        executeModel: args.execute_model,
+        verifyWith: args.verify_with,
+        verifyModel: args.verify_model,
+        criteria: args.verification_criteria,
+        maxIterations: args.max_iterations,
+        effort: args.effort,
+        agentTemplate: args.agent_template,
+      });
+
+      let output = `## Persistent Consult (Ralph Loop v2)\n\n`;
+      output += `**Status**: ${result.verified ? 'VERIFIED' : 'UNVERIFIED'} (${result.iterations} iteration${result.iterations > 1 ? 's' : ''})`;
+      if (result.confidence !== undefined) output += ` | **Confidence**: ${(result.confidence * 100).toFixed(0)}%`;
+      if (result.specPassed !== undefined) output += ` | **Spec**: ${result.specPassed ? 'PASS' : 'FAIL'}`;
+      if (result.qualityPassed !== undefined) output += ` | **Quality**: ${result.qualityPassed ? 'PASS' : 'ADVISORY'}`;
+      if (result.escalatedFrom) output += `\n**Escalated**: ${result.escalatedFrom} → ${result.escalatedTo}`;
+      if (result.agentStatus) output += `\n**Agent Status**: ${result.agentStatus}`;
+      output += `\n**Time**: ${(result.totalMs / 1000).toFixed(1)}s\n\n`;
+
+      // Show quality issues as advisory even when verified
+      if (result.qualityIssues?.length > 0) {
+        output += `### Quality Advisory\n`;
+        result.qualityIssues.forEach(issue => { output += `- ${issue}\n`; });
+        output += `\n`;
+      }
+
+      output += `### Output\n\n${result.output}\n\n`;
+
+      if (result.history.length > 0) {
+        output += `### Verification History\n`;
+        for (const h of result.history) {
+          if (h.error) {
+            output += `- Iteration ${h.iteration}: ERROR (${h.phase || h.stage}) — ${h.error}\n`;
+          } else if (h.delegated) {
+            output += `- Iteration ${h.iteration}: Delegated to Claude\n`;
+          } else if (h.phase === 'escalation') {
+            output += `- Iteration ${h.iteration}: ESCALATED ${h.from} → ${h.to} (${h.reason})\n`;
+          } else if (h.agentStatus) {
+            output += `- Iteration ${h.iteration}: Agent reported ${h.agentStatus}\n`;
+          } else {
+            const stageLabel = h.stage ? ` [${h.stage}]` : '';
+            output += `- Iteration ${h.iteration}${stageLabel}: ${h.passed ? 'PASSED' : 'FAILED'} (confidence: ${((h.confidence || 0) * 100).toFixed(0)}%)`;
+            if (h.issues?.length > 0) output += ` — ${h.issues.join('; ')}`;
+            if (h.evidence?.length > 0) output += ` | evidence: ${h.evidence.length} items`;
+            output += `\n`;
+          }
+        }
+      }
+
+      return {
+        content: [
+          { type: "text", text: output },
+          { type: "text", text: JSON.stringify(result) },
+        ],
+      };
     }
 
     if (name === "analyze_requirements") {
@@ -1103,12 +2558,14 @@ ${requirements}
         };
       }
 
-      // Step 2: Score, classify, and route each subtask (code-based)
+      // Step 2: Score, classify, and route each subtask (with intent + agent templates)
       const tasks = subtasks.map(st => {
         const complexity = scoreComplexity(st.description);
-        const taskType = classifyTaskType(st.description);
+        const intent = classifyIntent(st.description);
+        const taskType = intent ? intent.taskType : classifyTaskType(st.description);
         const route = routeTask(complexity.score, taskType);
         const mcpTools = recommendMCPTools(taskType, st.description);
+        const agent = intent ? AGENT_TEMPLATES[intent.agent] : resolveAgentTemplate(taskType, complexity.score);
 
         return {
           id: st.id,
@@ -1117,6 +2574,8 @@ ${requirements}
           dependencies: st.dependencies || [],
           complexity: { score: complexity.score, features: complexity.features, indicators: complexity.indicators },
           taskType,
+          ...(intent && { intent: intent.intent }),
+          ...(agent && { agent: agent.name || intent?.agent }),
           route: {
             model: route.model,
             reason: route.reason,
@@ -1161,6 +2620,8 @@ ${requirements}
         output += `**${task.id}**: ${task.title}\n`;
         output += `  - ${task.description}\n`;
         output += `  - Complexity: ${task.complexity.score}/10 | Type: ${task.taskType} | Route: ${task.route.model} (${task.route.reason})\n`;
+        if (task.intent) output += `  - Intent: ${task.intent}${task.agent ? ` → agent: ${task.agent}` : ''}\n`;
+        else if (task.agent) output += `  - Agent: ${task.agent}\n`;
         if (task.mcpTools.length > 0) {
           output += `  - MCP tools: ${task.mcpTools.map(t => `${t.server}/${t.tool}`).join(', ')}\n`;
         }
@@ -1211,21 +2672,32 @@ ${requirements}
 
             try {
               let result;
+              // Resolve agent system prompt for this task
+              const taskAgent = task.agent ? AGENT_TEMPLATES[task.agent] : resolveAgentTemplate(task.taskType, task.complexity?.score || 5);
+              const sysPrompt = taskAgent?.systemPrompt;
+
               switch (task.route.model) {
                 case 'gemini-flash':
-                  result = { model: 'gemini-flash', output: await callGeminiWithFallback('gemini-3-flash-preview', taskPrompt, null, 4096) };
+                  result = { model: 'gemini-flash', output: await callGeminiWithFallback('gemini-3-flash-preview', taskPrompt, null, 4096, sysPrompt) };
                   break;
                 case 'gemini-pro':
-                  result = { model: 'gemini-pro', output: await callGeminiWithFallback('gemini-3.1-pro-preview', taskPrompt, null, 8192) };
+                  result = { model: 'gemini-pro', output: await callGeminiWithFallback('gemini-3.1-pro-preview', taskPrompt, null, 8192, sysPrompt) };
                   break;
                 case 'openrouter':
-                  result = { model: task.route.modelKey || 'deepseek', output: await callOpenRouterWithFallback(task.route.modelKey || 'deepseek', taskPrompt, null, 4096) };
+                  result = { model: task.route.modelKey || 'deepseek', output: await callOpenRouterWithFallback(task.route.modelKey || 'deepseek', taskPrompt, null, 4096, sysPrompt) };
                   break;
                 case 'local':
                   if (LOCAL_SERVER_INFO.available) {
-                    result = { model: `local(${LOCAL_SERVER_INFO.name})`, output: await callLocalWithFallback(null, taskPrompt, null, 4096) };
+                    result = { model: `local(${LOCAL_SERVER_INFO.name})`, output: await callLocalWithFallback(null, taskPrompt, null, 4096, sysPrompt) };
                   } else {
                     result = { model: 'local', delegateTo: 'claude', prompt: taskPrompt, note: 'Local server unavailable — delegate to Claude' };
+                  }
+                  break;
+                case 'copilot':
+                  if (COPILOT_AVAILABLE) {
+                    result = { model: 'copilot', output: await callCopilotWithFallback(task.route.modelKey || 'gpt-4.1', taskPrompt, null, 4096, sysPrompt) };
+                  } else {
+                    result = { model: 'copilot', delegateTo: 'claude', prompt: taskPrompt, note: 'Copilot unavailable — delegate to Claude' };
                   }
                   break;
                 case 'codex':
@@ -1291,6 +2763,160 @@ ${requirements}
       };
     }
 
+    if (name === "bead_orchestrate") {
+      const { requirements, context, governance = true, budget_limit_cents, project_name = 'flywheel' } = args;
+      const PAPERCLIP_URL = process.env.PAPERCLIP_API_URL || 'http://127.0.0.1:3100';
+
+      // Step 1: Decompose requirements into beads using analyze_requirements logic
+      let tasks;
+      try {
+        const decompositionPrompt = `Decompose these requirements into self-contained "beads" (work units). Each bead must include:
+- id (br-NNN format)
+- title (short imperative)
+- description (self-contained, full context needed to implement)
+- dependencies (array of bead IDs that must complete first)
+- tests (acceptance criteria and test specs)
+
+Requirements:
+${requirements}${context ? `\n\nContext:\n${context}` : ''}
+
+Return a JSON array of beads. ONLY output valid JSON, no markdown.`;
+
+        let decomposedText;
+        try {
+          decomposedText = await callGeminiWithFallback('gemini-3-flash-preview', decompositionPrompt, null, 8192);
+        } catch {
+          decomposedText = await callOpenRouterWithFallback('deepseek', decompositionPrompt, null, 8192);
+        }
+
+        const jsonMatch = decomposedText.match(/\[[\s\S]*\]/);
+        tasks = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(decomposedText);
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Failed to decompose requirements into beads: ${err.message}` }],
+          isError: true,
+        };
+      }
+
+      // Step 2: Score and route each bead
+      const beads = tasks.map(task => {
+        const desc = `${task.title} ${task.description}`;
+        const { score, features } = scoreComplexity(desc);
+        const taskType = classifyTaskType(desc);
+        const route = routeTask(score, taskType);
+        const mcpTools = recommendMCPTools(taskType, desc);
+        return { ...task, complexity: score, taskType, route, mcpTools, features };
+      });
+
+      // Step 3: Build execution order
+      const executionOrder = buildExecutionOrder(beads);
+
+      // Step 4: Optionally create Paperclip governance tasks
+      let paperclipTasks = [];
+      if (governance) {
+        let paperclipAvailable = false;
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 2000);
+          const healthResp = await fetch(`${PAPERCLIP_URL}/api/health`, { signal: ctrl.signal });
+          clearTimeout(timer);
+          paperclipAvailable = healthResp.ok;
+        } catch { /* Paperclip not running */ }
+
+        if (paperclipAvailable) {
+          for (const bead of beads) {
+            try {
+              const taskResp = await fetch(`${PAPERCLIP_URL}/api/tasks`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  title: `[${bead.id}] ${bead.title}`,
+                  description: bead.description,
+                  project: project_name,
+                  metadata: {
+                    bead_id: bead.id,
+                    complexity: bead.complexity,
+                    task_type: bead.taskType,
+                    routed_to: bead.route.model,
+                    dependencies: bead.dependencies,
+                  },
+                }),
+              });
+              if (taskResp.ok) {
+                const taskData = await taskResp.json();
+                paperclipTasks.push({ bead_id: bead.id, task_id: taskData.id || taskData.task_id, status: 'created' });
+              }
+            } catch { /* Skip individual task creation failures */ }
+          }
+
+          // Set budget if specified
+          if (budget_limit_cents) {
+            try {
+              await fetch(`${PAPERCLIP_URL}/api/budget`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ project: project_name, monthly_limit_cents: budget_limit_cents }),
+              });
+            } catch { /* Budget setting optional */ }
+          }
+        }
+      }
+
+      // Step 5: Format output
+      const modelDistribution = {};
+      for (const bead of beads) {
+        const model = bead.route.model;
+        modelDistribution[model] = (modelDistribution[model] || 0) + 1;
+      }
+
+      let output = `## Bead Orchestration Plan\n\n`;
+      output += `**${beads.length} beads** decomposed from requirements\n`;
+      output += `**Model distribution**: ${Object.entries(modelDistribution).map(([m, c]) => `${m}(${c})`).join(', ')}\n`;
+      if (paperclipTasks.length > 0) {
+        output += `**Paperclip tasks**: ${paperclipTasks.length} created (project: ${project_name})\n`;
+      }
+      if (budget_limit_cents) {
+        output += `**Budget limit**: $${(budget_limit_cents / 100).toFixed(2)}\n`;
+      }
+      output += `\n### Beads\n\n`;
+
+      for (const bead of beads) {
+        const pcTask = paperclipTasks.find(t => t.bead_id === bead.id);
+        output += `**${bead.id}**: ${bead.title}\n`;
+        output += `  Complexity: ${bead.complexity}/10 | Type: ${bead.taskType} | Route: ${bead.route.model} (${bead.route.reason})\n`;
+        if (bead.dependencies?.length > 0) output += `  Dependencies: ${bead.dependencies.join(', ')}\n`;
+        if (bead.mcpTools?.length > 0) output += `  MCP tools: ${bead.mcpTools.map(t => `${t.server}/${t.tool}`).join(', ')}\n`;
+        if (pcTask) output += `  Paperclip task: ${pcTask.task_id}\n`;
+        output += `\n`;
+      }
+
+      output += `### Execution Order\n\n`;
+      executionOrder.forEach((group, i) => {
+        output += `Phase ${i + 1} (parallel): ${group.map(id => {
+          const b = beads.find(bb => bb.id === id);
+          return b ? `${id}→${b.route.model}` : id;
+        }).join(', ')}\n`;
+      });
+
+      output += `\n---\n_Use execute_routing_plan with the plan JSON to execute, or dispatch individual beads via NTM._`;
+
+      // Build plan object compatible with execute_routing_plan
+      const plan = {
+        tasks: beads,
+        executionOrder,
+        paperclipTasks,
+        project: project_name,
+        budget_limit_cents,
+      };
+
+      return {
+        content: [
+          { type: "text", text: output },
+          { type: "text", text: JSON.stringify(plan) },
+        ],
+      };
+    }
+
     throw new Error(`Unknown tool: ${name}`);
   } catch (error) {
     return {
@@ -1304,6 +2930,231 @@ ${requirements}
     };
   }
 });
+
+// ─── HTTP API Gateway (OpenAI-compatible) ──────────────────────────────────────
+// Exposes multi-model-router as an HTTP server so external tools (Agent Flywheel
+// CLI wrappers, custom scripts) can route through the same intelligent model
+// routing, fallback chains, and complexity scoring.
+
+const MMR_HTTP_PORT = parseInt(process.env.MMR_HTTP_PORT || '8787', 10);
+
+if (MMR_HTTP_PORT > 0) {
+  try {
+    const express = require('express');
+    const app = express();
+    app.use(express.json({ limit: '10mb' }));
+
+    // Health check
+    app.get('/health', (_req, res) => {
+      res.json({
+        status: 'ok',
+        version: '3.1.0',
+        providers: {
+          gemini_cli: GEMINI_CLI_AVAILABLE,
+          gemini_api: !!GEMINI_API_KEY,
+          openrouter: !!OPENROUTER_API_KEY,
+          requesty: !!REQUESTY_API_KEY,
+          codex: CODEX_AVAILABLE,
+          copilot: COPILOT_AVAILABLE,
+          local: LOCAL_SERVER_INFO.available ? LOCAL_SERVER_INFO.name : false,
+          firecrawl: !!FIRECRAWL_API_KEY,
+        },
+        circuitBreaker: providerHealth.getStatus(),
+      });
+    });
+
+    // Quality stats
+    app.get('/v1/stats', (_req, res) => {
+      res.json({
+        health: providerHealth.getStatus(),
+        quality: qualityTracker.getAllStats(),
+        effortLevels: EFFORT_LEVELS,
+        agentTemplates: Object.keys(AGENT_TEMPLATES),
+      });
+    });
+
+    // List available models
+    app.get('/v1/models', async (_req, res) => {
+      const models = [
+        { id: 'auto', name: 'Auto-route (complexity scoring)', owned_by: 'multi-model-router' },
+        { id: 'gemini-pro', name: 'Gemini 3.1 Pro Preview', owned_by: 'google', available: GEMINI_CLI_AVAILABLE || !!GEMINI_API_KEY },
+        { id: 'gemini-flash', name: 'Gemini Flash 3', owned_by: 'google', available: GEMINI_CLI_AVAILABLE || !!GEMINI_API_KEY },
+        { id: 'deepseek', name: 'DeepSeek V3.2', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'qwen', name: 'Qwen 3.5', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'glm', name: 'GLM-5', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'minimax', name: 'Minimax M2.5', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'codex', name: 'Codex CLI (gpt-5.3-codex)', owned_by: 'openai', available: CODEX_AVAILABLE },
+        { id: 'copilot', name: 'GitHub Copilot', owned_by: 'github', available: COPILOT_AVAILABLE },
+        { id: 'local', name: LOCAL_SERVER_INFO.available ? `Local (${LOCAL_SERVER_INFO.name})` : 'Local (not detected)', owned_by: 'local', available: LOCAL_SERVER_INFO.available },
+      ];
+
+      if (LOCAL_SERVER_INFO.available) {
+        const localModels = await listLocalModels();
+        for (const lm of localModels) {
+          models.push({ id: `local:${lm.id}`, name: lm.name, owned_by: LOCAL_SERVER_INFO.name, available: true });
+        }
+      }
+
+      res.json({ object: 'list', data: models });
+    });
+
+    // OpenAI-compatible chat completions
+    app.post('/v1/chat/completions', async (req, res) => {
+      const { model = 'auto', messages = [], max_tokens, context, effort } = req.body;
+
+      // Extract prompt from messages
+      const prompt = messages
+        .filter(m => m.role === 'user')
+        .map(m => m.content)
+        .join('\n\n');
+
+      if (!prompt) {
+        return res.status(400).json({ error: { message: 'No user messages provided', type: 'invalid_request_error' } });
+      }
+
+      const systemContext = context || messages
+        .filter(m => m.role === 'system')
+        .map(m => m.content)
+        .join('\n\n') || null;
+
+      const { maxTokens: effectiveMaxTokens, scoreBoost } = applyEffort(effort, max_tokens || 4096);
+      const id = `mmr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const created = Math.floor(Date.now() / 1000);
+
+      try {
+        let result, routingInfo;
+
+        if (model === 'auto') {
+          // Smart routing: intent detection → score complexity → classify type → route
+          const intent = classifyIntent(prompt);
+          const { score: rawScore, features } = scoreComplexity(prompt);
+          const score = Math.max(0, Math.min(10, rawScore + (scoreBoost || 0)));
+          const taskType = intent ? intent.taskType : classifyTaskType(prompt);
+          const route = routeTask(score, taskType);
+          const agent = intent ? AGENT_TEMPLATES[intent.agent] : resolveAgentTemplate(taskType, score);
+          routingInfo = {
+            complexity: score, taskType, provider: route.model, reason: route.reason, features,
+            ...(intent && { intent: intent.intent, agent: intent.agent }),
+            ...(effort && { effort }),
+          };
+
+          if (route.model === 'inline' || route.model === 'opus') {
+            // Cannot handle inline/opus via HTTP — delegate back to caller
+            return res.json({
+              id, object: 'chat.completion', created,
+              model: 'delegate-to-claude',
+              choices: [{ index: 0, message: { role: 'assistant', content: prompt }, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+              _routing: { ...routingInfo, delegated: true },
+            });
+          }
+
+          // Route to the appropriate provider with agent system prompt
+          result = await routeToProvider(route.model, route.modelKey, prompt, systemContext, effectiveMaxTokens, route, agent?.systemPrompt);
+        } else {
+          // Direct model routing
+          const directIntent = classifyIntent(prompt);
+          const directAgent = directIntent ? AGENT_TEMPLATES[directIntent.agent] : null;
+          routingInfo = { provider: model, direct: true, ...(directIntent && { intent: directIntent.intent }) };
+          result = await routeToProvider(model, null, prompt, systemContext, effectiveMaxTokens, {}, directAgent?.systemPrompt);
+        }
+
+        // Check if result is a delegate response
+        if (typeof result === 'string') {
+          try {
+            const parsed = JSON.parse(result);
+            if (parsed.delegateTo === 'claude') {
+              return res.json({
+                id, object: 'chat.completion', created,
+                model: 'delegate-to-claude',
+                choices: [{ index: 0, message: { role: 'assistant', content: prompt }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                _routing: { ...routingInfo, delegated: true, failureReason: parsed.failureReason },
+              });
+            }
+          } catch { /* not JSON, it's actual content */ }
+        }
+
+        const content = typeof result === 'string' ? result : JSON.stringify(result);
+        res.json({
+          id, object: 'chat.completion', created,
+          model: routingInfo.provider || model,
+          choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          _routing: routingInfo,
+        });
+
+      } catch (error) {
+        res.status(500).json({
+          error: { message: error.message, type: 'server_error' },
+          _routing: { provider: model, error: true },
+        });
+      }
+    });
+
+    // Memory bridge endpoints (for cm/cass shims)
+    app.post('/memory/store', async (req, res) => {
+      const { key, value, type, namespace } = req.body;
+      res.json({ status: 'stored', key, note: 'Route to claude-flow memory_store MCP tool' });
+    });
+
+    app.post('/memory/search', async (req, res) => {
+      const { query, namespace } = req.body;
+      res.json({ status: 'search', query, note: 'Route to claude-flow memory_search MCP tool' });
+    });
+
+    // Central routing function used by the HTTP gateway
+    async function routeToProvider(model, modelKey, prompt, context, maxTokens, route, systemPrompt) {
+      switch (model) {
+        case 'gemini-pro':
+          return callGeminiWithFallback('gemini-3.1-pro-preview', prompt, context, maxTokens, systemPrompt);
+        case 'gemini-flash':
+          return callGeminiWithFallback('gemini-3-flash-preview', prompt, context, maxTokens, systemPrompt);
+        case 'openrouter':
+          return callOpenRouterWithFallback(modelKey || 'deepseek', prompt, context, maxTokens, systemPrompt);
+        case 'deepseek':
+          return callOpenRouterWithFallback('deepseek', prompt, context, maxTokens, systemPrompt);
+        case 'qwen':
+          return callOpenRouterWithFallback('qwen', prompt, context, maxTokens, systemPrompt);
+        case 'glm':
+          return callOpenRouterWithFallback('glm', prompt, context, maxTokens, systemPrompt);
+        case 'minimax':
+          return callOpenRouterWithFallback('minimax', prompt, context, maxTokens, systemPrompt);
+        case 'codex':
+          return callCodexWithFallback(prompt, context, {
+            sandbox: route.sandbox || 'read-only',
+            fullAuto: route.fullAuto || false,
+            max_tokens: maxTokens,
+          });
+        case 'copilot':
+          return callCopilotWithFallback(modelKey || 'gpt-4.1', prompt, context, maxTokens, systemPrompt);
+        case 'local': {
+          const localModel = modelKey || undefined;
+          return callLocalWithFallback(localModel, prompt, context, maxTokens, systemPrompt);
+        }
+        default: {
+          if (model.startsWith('local:')) {
+            return callLocalWithFallback(model.slice(6), prompt, context, maxTokens, systemPrompt);
+          }
+          if (model.startsWith('requesty:')) {
+            return callRequestyWithFallback(model.slice(9), prompt, context, maxTokens, systemPrompt);
+          }
+          if (model.includes('/')) {
+            return callRequestyWithFallback(model, prompt, context, maxTokens, systemPrompt);
+          }
+          return callOpenRouterWithFallback(model, prompt, context, maxTokens, systemPrompt);
+        }
+      }
+    }
+
+    app.listen(MMR_HTTP_PORT, '127.0.0.1', () => {
+      // Log to stderr so it doesn't interfere with MCP stdio
+      process.stderr.write(`[multi-model-router] HTTP gateway listening on http://127.0.0.1:${MMR_HTTP_PORT}\n`);
+    });
+  } catch (err) {
+    process.stderr.write(`[multi-model-router] HTTP gateway failed to start: ${err.message}\n`);
+  }
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
