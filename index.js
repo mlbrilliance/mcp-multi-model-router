@@ -10,7 +10,10 @@ import { spawn as spawnProcess } from 'child_process';
 import { execSync } from 'child_process';
 import { createRequire } from 'module';
 import { createHash } from 'crypto';
+import { classifyByEmbedding, primeExemplars, classifierStats } from './src/classifier/knn.js';
 const require = createRequire(import.meta.url);
+
+const ROUTER_CLASSIFIER = process.env.ROUTER_CLASSIFIER || 'shadow'; // shadow | keyword | hybrid
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
@@ -241,10 +244,37 @@ class QualityTracker {
   constructor(maxEntries = 1000) {
     this.maxEntries = maxEntries;
     this.records = [];
+    this.shadowRecords = [];
+    this.shadowMax = 500;
   }
   record(model, taskType, success, latencyMs) {
     this.records.push({ model, taskType, timestamp: Date.now(), success, latencyMs });
     if (this.records.length > this.maxEntries) this.records.shift();
+  }
+  recordShadow(entry) {
+    this.shadowRecords.push({ ts: Date.now(), ...entry });
+    if (this.shadowRecords.length > this.shadowMax) this.shadowRecords.shift();
+  }
+  getShadowStats() {
+    const total = this.shadowRecords.length;
+    if (total === 0) return { total: 0 };
+    let agreed = 0;
+    const disagreements = {};
+    for (const r of this.shadowRecords) {
+      if (r.agreed) { agreed++; continue; }
+      const key = `${r.keyword || 'null'}→${r.knn || 'null'}`;
+      disagreements[key] = (disagreements[key] || 0) + 1;
+    }
+    const top = Object.entries(disagreements)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([k, n]) => ({ pair: k, count: n }));
+    return {
+      total,
+      agreementRate: agreed / total,
+      disagreements: total - agreed,
+      topDisagreements: top,
+    };
   }
   getStats(model, taskType) {
     const relevant = this.records.filter(r =>
@@ -1668,7 +1698,7 @@ const INTENT_TRIGGERS = {
   'implement-feature': { keywords: ['implement', 'build feature', 'create feature', 'add feature', 'new feature'], taskType: 'code', agent: 'code-reviewer' },
 };
 
-function classifyIntent(description) {
+function classifyIntentKeyword(description) {
   const desc = description.toLowerCase();
   let bestIntent = null, bestMatches = 0;
   for (const [intent, config] of Object.entries(INTENT_TRIGGERS)) {
@@ -1679,6 +1709,44 @@ function classifyIntent(description) {
     }
   }
   return bestIntent && bestIntent.confidence >= 0.3 ? bestIntent : null;
+}
+
+// Shadow-mode wrapper: runs the keyword classifier as today, and (when enabled)
+// fires a no-await kNN comparison whose result feeds QualityTracker for later
+// inspection via router_stats. Behavior is unchanged in 'shadow' mode — the
+// keyword result is always returned. This is Phase 1 of the embedding-classifier
+// rollout (see plans/for-multi-model-router-the-keyword-class-vast-fox.md).
+function classifyIntent(description) {
+  const keywordResult = classifyIntentKeyword(description);
+  if (ROUTER_CLASSIFIER === 'keyword') return keywordResult;
+  // 'shadow' (default) or 'hybrid' — fire a comparison, never block.
+  runShadowComparison(description, keywordResult).catch(() => { /* swallow */ });
+  return keywordResult;
+}
+
+async function runShadowComparison(description, keywordResult) {
+  let knn;
+  try {
+    knn = await classifyByEmbedding(description);
+  } catch (err) {
+    qualityTracker.recordShadow({
+      prompt: description.slice(0, 120),
+      keyword: keywordResult?.intent || null,
+      knn: null,
+      knnConfidence: null,
+      agreed: false,
+      error: String(err && err.message || err).slice(0, 100),
+    });
+    return;
+  }
+  const knnIntent = knn.confidence >= knn.floor ? knn.intent : null;
+  qualityTracker.recordShadow({
+    prompt: description.slice(0, 120),
+    keyword: keywordResult?.intent || null,
+    knn: knnIntent,
+    knnConfidence: Number(knn.confidence.toFixed(3)),
+    agreed: (keywordResult?.intent || null) === knnIntent,
+  });
 }
 
 async function callFirecrawl(action, params) {
@@ -1981,7 +2049,7 @@ function buildExecutionOrder(tasks) {
 }
 
 const server = new Server(
-  { name: "multi-model-router", version: "3.2.0" },
+  { name: "multi-model-router", version: "3.3.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -2717,6 +2785,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       output += `\n### Effort Levels\n`;
       for (const [level, cfg] of Object.entries(EFFORT_LEVELS)) {
         output += `- **${level}**: maxTokens=${cfg.maxTokens}, scoreBoost=${cfg.scoreBoost > 0 ? '+' : ''}${cfg.scoreBoost}, tier=${cfg.modelTier}\n`;
+      }
+
+      output += `\n### Classifier (mode=${ROUTER_CLASSIFIER})\n`;
+      const cstats = classifierStats();
+      output += `- Exemplars: ${cstats.exemplars.total} across ${Object.keys(cstats.exemplars.byIntent).length} intents (primed=${cstats.primed})\n`;
+      const shadow = qualityTracker.getShadowStats();
+      if (shadow.total === 0) {
+        output += `- Shadow comparisons: none yet (kNN may still be priming)\n`;
+      } else {
+        output += `- Shadow comparisons: ${shadow.total} (agreement ${(shadow.agreementRate * 100).toFixed(0)}%, ${shadow.disagreements} disagreements)\n`;
+        if (shadow.topDisagreements.length) {
+          output += `- Top disagreements (keyword→knn):\n`;
+          for (const d of shadow.topDisagreements) output += `    - ${d.pair}: ${d.count}\n`;
+        }
       }
 
       return { content: [{ type: "text", text: output }] };
@@ -3630,3 +3712,14 @@ if (MMR_HTTP_PORT > 0) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// Phase 1 (shadow) — warm the embedding classifier in the background.
+// Never blocks MCP startup. If it fails, the keyword classifier remains the
+// only authority; shadow comparisons just won't fire.
+if (ROUTER_CLASSIFIER !== 'keyword') {
+  primeExemplars().then(() => {
+    process.stderr.write(`[multi-model-router] embedding classifier primed (mode=${ROUTER_CLASSIFIER})\n`);
+  }).catch(err => {
+    process.stderr.write(`[multi-model-router] embedding classifier failed to prime: ${err.message}\n`);
+  });
+}

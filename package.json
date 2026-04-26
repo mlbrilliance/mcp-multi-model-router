@@ -1,7 +1,7 @@
 {
   "name": "multi-model-router",
-  "version": "3.2.0",
-  "description": "MCP server routing to GLM 5.1, Gemini, OpenRouter, Codex, Requesty, Copilot, and local inference with agent templates, behavioral governance, circuit breakers, quality tracking, and intent classification. GLM 5.1 is the primary coding agent.",
+  "version": "3.3.0",
+  "description": "MCP server routing to GLM 5.1, Gemini, OpenRouter, Codex, Requesty, Copilot, and local inference with agent templates, behavioral governance, circuit breakers, quality tracking, and embedding-based intent classification (BGE-small via fastembed) running in shadow mode alongside the keyword classifier.",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "fastembed": "^2.1.0"
   }
 }
