@@ -20,10 +20,21 @@ const LOCAL_MODEL_BASE_URL = process.env.LOCAL_MODEL_BASE_URL || null;
 const LOCAL_MODEL_PROVIDER = process.env.LOCAL_MODEL_PROVIDER || null;
 
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY;
+const GLM_API_KEY = process.env.GLM_API_KEY || null;
+const GLM_AVAILABLE = !!GLM_API_KEY;
+const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || null;
+const MINIMAX_AVAILABLE = !!MINIMAX_API_KEY;
 
 const CODEX_AVAILABLE = (() => {
   try {
     execSync('codex --version', { stdio: 'pipe' });
+    return true;
+  } catch { return false; }
+})();
+
+const COPILOT_CLI_AVAILABLE = (() => {
+  try {
+    execSync('copilot --version', { stdio: 'pipe', timeout: 5000 });
     return true;
   } catch { return false; }
 })();
@@ -259,6 +270,74 @@ class QualityTracker {
   }
 }
 const qualityTracker = new QualityTracker();
+
+// --- GLM 5.1 Startup Health Probe ---
+if (GLM_API_KEY) {
+  (async () => {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      const resp = await fetch("https://api.z.ai/api/coding/paas/v4/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${GLM_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "glm-5.1",
+          messages: [{ role: "user", content: "Hi" }],
+          max_tokens: 16,
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (resp.ok) {
+        providerHealth.recordSuccess('glm-direct');
+        process.stderr.write('[mmr] GLM 5.1 health probe: OK\n');
+      } else {
+        providerHealth.recordFailure('glm-direct');
+        process.stderr.write(`[mmr] GLM 5.1 health probe: HTTP ${resp.status}\n`);
+      }
+    } catch (err) {
+      providerHealth.recordFailure('glm-direct');
+      process.stderr.write(`[mmr] GLM 5.1 health probe: ${err.message}\n`);
+    }
+  })();
+}
+
+// --- MiniMax M2.7 Startup Health Probe ---
+if (MINIMAX_API_KEY) {
+  (async () => {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      const resp = await fetch("https://api.minimax.io/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${MINIMAX_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "MiniMax-M2.7",
+          messages: [{ role: "user", content: "Hi" }],
+          max_tokens: 16,
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (resp.ok) {
+        providerHealth.recordSuccess('minimax-direct');
+        process.stderr.write('[mmr] MiniMax M2.7 health probe: OK\n');
+      } else {
+        providerHealth.recordFailure('minimax-direct');
+        process.stderr.write(`[mmr] MiniMax M2.7 health probe: HTTP ${resp.status}\n`);
+      }
+    } catch (err) {
+      providerHealth.recordFailure('minimax-direct');
+      process.stderr.write(`[mmr] MiniMax M2.7 health probe: ${err.message}\n`);
+    }
+  })();
+}
 
 // --- Reasoning Effort Levels ---
 
@@ -531,6 +610,72 @@ async function callLocal(model, prompt, context, maxTokens, systemPrompt) {
   return text;
 }
 
+async function callGLM(prompt, context, maxTokens, systemPrompt) {
+  if (!GLM_API_KEY) {
+    throw new Error("GLM_API_KEY not set");
+  }
+  const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const messages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    { role: "user", content: fullPrompt },
+  ];
+  const response = await fetchWithTimeout("https://api.z.ai/api/coding/paas/v4/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GLM_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "glm-5.1",
+      messages,
+      max_tokens: maxTokens || 8192,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`GLM API error ${response.status}: ${err}`);
+  }
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error(`Unexpected GLM response: ${JSON.stringify(data)}`);
+  }
+  return text;
+}
+
+async function callMiniMax(prompt, context, maxTokens, systemPrompt) {
+  if (!MINIMAX_API_KEY) {
+    throw new Error("MINIMAX_API_KEY not set");
+  }
+  const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const messages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    { role: "user", content: fullPrompt },
+  ];
+  const response = await fetchWithTimeout("https://api.minimax.io/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${MINIMAX_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "MiniMax-M2.7",
+      messages,
+      max_tokens: maxTokens || 8192,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`MiniMax API error ${response.status}: ${err}`);
+  }
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error(`Unexpected MiniMax response: ${JSON.stringify(data)}`);
+  }
+  return text;
+}
+
 async function listLocalModels() {
   if (!LOCAL_SERVER_INFO.available) return [];
   try {
@@ -602,6 +747,88 @@ async function callOpenRouterWithFallback(modelKey, prompt, context, maxTokens, 
     } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
   }
   qualityTracker.record(`openrouter:${modelKey}`, null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
+}
+
+async function callGLMWithFallback(prompt, context, maxTokens, systemPrompt) {
+  const cached = responseCache.get('glm-direct', prompt, context);
+  if (cached) return cached;
+  const errors = [];
+  const t0 = Date.now();
+  // Try 1: Direct GLM API (api.z.ai)
+  if (GLM_API_KEY && providerHealth.isAvailable('glm-direct')) {
+    try {
+      const result = await callGLM(prompt, context, maxTokens, systemPrompt);
+      responseCache.set('glm-direct', prompt, context, result);
+      providerHealth.recordSuccess('glm-direct');
+      qualityTracker.record('glm-direct', null, true, Date.now() - t0);
+      return result;
+    } catch (err) {
+      errors.push(`GLM-Direct: ${err.message}`);
+      providerHealth.recordFailure('glm-direct');
+    }
+  }
+  // Try 2: OpenRouter GLM
+  if (OPENROUTER_API_KEY && providerHealth.isAvailable('openrouter')) {
+    try {
+      const result = await callOpenRouter('glm', prompt, context, maxTokens, systemPrompt);
+      responseCache.set('glm-direct', prompt, context, result);
+      providerHealth.recordSuccess('openrouter');
+      return result;
+    } catch (err) {
+      errors.push(`OpenRouter(glm): ${err.message}`);
+      // Try minimax as OpenRouter backup
+      try {
+        const result = await callOpenRouter('minimax', prompt, context, maxTokens, systemPrompt);
+        responseCache.set('glm-direct', prompt, context, result);
+        return result;
+      } catch (err2) { errors.push(`OpenRouter(minimax): ${err2.message}`); }
+    }
+  }
+  // Try 3: Requesty GLM
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
+    try {
+      const result = await callRequesty('glm', prompt, context, maxTokens, systemPrompt);
+      responseCache.set('glm-direct', prompt, context, result);
+      providerHealth.recordSuccess('requesty');
+      return result;
+    } catch (err) { errors.push(`Requesty(glm): ${err.message}`); providerHealth.recordFailure('requesty'); }
+  }
+  qualityTracker.record('glm-direct', null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
+}
+
+async function callMiniMaxWithFallback(prompt, context, maxTokens, systemPrompt) {
+  const cached = responseCache.get('minimax-direct', prompt, context);
+  if (cached) return cached;
+  const errors = [];
+  const t0 = Date.now();
+  // Try 1: Direct MiniMax API (api.minimax.io)
+  if (MINIMAX_API_KEY && providerHealth.isAvailable('minimax-direct')) {
+    try {
+      const result = await callMiniMax(prompt, context, maxTokens, systemPrompt);
+      responseCache.set('minimax-direct', prompt, context, result);
+      providerHealth.recordSuccess('minimax-direct');
+      qualityTracker.record('minimax-direct', null, true, Date.now() - t0);
+      return result;
+    } catch (err) {
+      errors.push(`MiniMax-Direct: ${err.message}`);
+      providerHealth.recordFailure('minimax-direct');
+    }
+  }
+  // Try 2: OpenRouter minimax
+  if (OPENROUTER_API_KEY && providerHealth.isAvailable('openrouter')) {
+    try {
+      const result = await callOpenRouter('minimax', prompt, context, maxTokens, systemPrompt);
+      responseCache.set('minimax-direct', prompt, context, result);
+      providerHealth.recordSuccess('openrouter');
+      return result;
+    } catch (err) {
+      errors.push(`OpenRouter(minimax): ${err.message}`);
+      providerHealth.recordFailure('openrouter');
+    }
+  }
+  qualityTracker.record('minimax-direct', null, false, Date.now() - t0);
   return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
@@ -735,6 +962,75 @@ async function callCodexWithFallback(prompt, context, options = {}) {
   return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
+async function callCopilotCli(prompt, context, options = {}) {
+  const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt;
+  const args = ['-p', fullPrompt, '-s'];
+
+  const mode = options.mode || 'plan';
+  args.push('--mode', mode);
+  if (options.model) args.push('--model', options.model);
+  // `-p` requires tool pre-approval to avoid hanging on confirmation prompts.
+  // plan mode runs no tools; autopilot implies allow-all; interactive needs it explicit.
+  if (mode === 'interactive') args.push('--allow-all-tools');
+
+  return new Promise((resolve, reject) => {
+    const proc = spawnProcess('copilot', args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: options.timeout || 120000,
+    });
+    setImmediate(() => { try { proc.stdin.end(); } catch {} });
+
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => stdout += d);
+    proc.stderr.on('data', d => stderr += d);
+    proc.on('close', code => {
+      if (code === 0 || stdout.length > 0) {
+        resolve(stdout.trim());
+      } else {
+        const msg = stderr.trim() || `Copilot CLI exited ${code} with no output`;
+        if (/login|auth|not authenticated|unauthori[sz]ed/i.test(msg)) {
+          reject(new Error(`Copilot CLI not authenticated. Run: copilot (then /login). Underlying: ${msg}`));
+        } else {
+          reject(new Error(`Copilot CLI exited ${code}: ${msg}`));
+        }
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+
+async function callCopilotCliWithFallback(prompt, context, options = {}) {
+  const errors = [];
+  const t0 = Date.now();
+  if (COPILOT_CLI_AVAILABLE && providerHealth.isAvailable('copilot-cli')) {
+    try {
+      const result = await callCopilotCli(prompt, context, options);
+      providerHealth.recordSuccess('copilot-cli');
+      qualityTracker.record('copilot-cli', null, true, Date.now() - t0);
+      return result;
+    } catch (err) {
+      errors.push(`CopilotCLI: ${err.message}`);
+      providerHealth.recordFailure('copilot-cli');
+    }
+  }
+  if (COPILOT_AVAILABLE && providerHealth.isAvailable('copilot')) {
+    try {
+      const result = await callCopilot('gpt-4.1', prompt, context, options.max_tokens || 4096);
+      providerHealth.recordSuccess('copilot');
+      return result;
+    } catch (err) { errors.push(`Copilot(HTTP): ${err.message}`); providerHealth.recordFailure('copilot'); }
+  }
+  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
+    try {
+      const result = await callRequesty('deepseek', prompt, context, options.max_tokens || 4096);
+      providerHealth.recordSuccess('requesty');
+      return result;
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
+  }
+  qualityTracker.record('copilot-cli', null, false, Date.now() - t0);
+  return makeDelegateResponse(prompt, context, formatErrors(errors));
+}
+
 // --- Ralph Loop (Persistent Consult with Model-Based Verification) ---
 
 const RALPH_DEFAULTS = { maxIterations: 3, maxMaxIterations: 5, confidenceThreshold: 0.85, defaultEffort: 'high' };
@@ -752,6 +1048,12 @@ const DEFAULT_VERIFICATION_CRITERIA = {
 };
 
 function pickVerifier(executionProvider) {
+  // Don't verify with the same provider family
+  if (executionProvider === 'glm-direct') {
+    if (GEMINI_CLI_AVAILABLE || GEMINI_API_KEY) return { provider: 'gemini-flash', model: null };
+    if (COPILOT_AVAILABLE) return { provider: 'copilot', model: 'gpt-4.1' };
+    if (OPENROUTER_API_KEY) return { provider: 'openrouter', model: 'deepseek' };
+  }
   if (executionProvider && executionProvider.startsWith('gemini')) {
     if (COPILOT_AVAILABLE) return { provider: 'copilot', model: 'gpt-4.1' };
     if (OPENROUTER_API_KEY) return { provider: 'openrouter', model: 'deepseek' };
@@ -767,13 +1069,14 @@ function pickVerifier(executionProvider) {
 // After repeated failures, escalate to more capable models instead of retrying the same one.
 
 const ESCALATION_LADDER = {
-  'local':        ['openrouter', 'gemini-flash', 'gemini-pro', 'opus'],
-  'openrouter':   ['gemini-flash', 'gemini-pro', 'copilot', 'opus'],
+  'local':        ['glm-direct', 'openrouter', 'gemini-flash', 'gemini-pro', 'opus'],
+  'glm-direct':   ['codex', 'gemini-pro', 'opus'],
+  'openrouter':   ['glm-direct', 'gemini-flash', 'gemini-pro', 'copilot', 'opus'],
   'gemini-flash': ['gemini-pro', 'copilot', 'opus'],
   'gemini-pro':   ['copilot', 'opus'],
-  'copilot':      ['gemini-pro', 'opus'],
-  'codex':        ['gemini-pro', 'opus'],
-  'requesty':     ['gemini-pro', 'opus'],
+  'copilot':      ['glm-direct', 'gemini-pro', 'opus'],
+  'codex':        ['glm-direct', 'gemini-pro', 'opus'],
+  'requesty':     ['glm-direct', 'gemini-pro', 'opus'],
 };
 
 function getEscalationTarget(currentProvider, failCount) {
@@ -881,6 +1184,7 @@ async function callProvider(provider, model, prompt, context, maxTokens, sysProm
   switch (provider) {
     case 'gemini-pro': return await callGeminiWithFallback('gemini-3.1-pro-preview', prompt, context, maxTokens, sysPrompt);
     case 'gemini-flash': return await callGeminiWithFallback('gemini-3-flash-preview', prompt, context, maxTokens, sysPrompt);
+    case 'glm-direct': return await callGLMWithFallback(prompt, context, maxTokens, sysPrompt);
     case 'openrouter': return await callOpenRouterWithFallback(model || 'deepseek', prompt, context, maxTokens, sysPrompt);
     case 'copilot': return await callCopilotWithFallback(model || 'gpt-4.1', prompt, context, maxTokens, sysPrompt);
     case 'codex': return await callCodexWithFallback(prompt, context, { max_tokens: maxTokens });
@@ -1200,7 +1504,7 @@ const AGENT_TEMPLATES = {
     systemPrompt: `You are an expert code reviewer. Focus on correctness, edge cases, performance, and maintainability. Be specific about line-level issues. Flag potential bugs, suggest improvements.
 
 Violating the letter of the rules is violating the spirit of the rules.${SUBAGENT_STATUS_PROTOCOL}`,
-    preferredModel: 'inline',
+    preferredModel: 'glm-direct',
     taskTypes: ['code', 'refactor'],
     complexityRange: [5, 8],
   },
@@ -1230,9 +1534,15 @@ Violating the letter of the rules is violating the spirit of the rules.${RED_FLA
     systemPrompt: `You are a test engineer. Write thorough tests covering happy paths, edge cases, error conditions, and boundary values. Structure tests clearly with arrange-act-assert pattern.
 
 Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS['test-engineer']}${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'glm-direct',
+    taskTypes: ['test'],
+    complexityRange: [5, 8],
+  },
+  'test-engineer-simple': {
+    systemPrompt: `You are a test engineer. Write clear, focused tests for simple functionality. Cover happy path and basic error cases. Use arrange-act-assert pattern.${SUBAGENT_STATUS_PROTOCOL}`,
     preferredModel: 'codex',
     taskTypes: ['test'],
-    complexityRange: [3, 8],
+    complexityRange: [3, 4],
   },
   'debugger': {
     systemPrompt: `You are a debugging specialist. Systematically isolate the root cause through hypothesis testing. Check recent changes, dependency versions, and environment differences. Provide fix with explanation.
@@ -1248,9 +1558,21 @@ If >= 3 fix attempts: STOP. Question the architecture. Pattern indicators of sys
   - Each fix creates new symptoms elsewhere
 
 Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS.debugger}${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'glm-direct',
+    taskTypes: ['debug'],
+    complexityRange: [5, 8],
+  },
+  'debugger-expert': {
+    systemPrompt: `You are a senior debugging specialist handling the most complex, cross-system debugging scenarios. Systematically isolate the root cause through hypothesis testing. Check recent changes, dependency versions, and environment differences.
+
+Phase 1: OBSERVE — Read errors, logs, and recent changes. Form hypotheses.
+Phase 2: ISOLATE — Narrow to smallest reproducing case.
+Phase 3: FIX — Address root cause, not symptoms. Verify fix doesn't regress.
+
+Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS.debugger}${SUBAGENT_STATUS_PROTOCOL}`,
     preferredModel: 'opus',
     taskTypes: ['debug'],
-    complexityRange: [5, 10],
+    complexityRange: [9, 10],
   },
   'script-writer': {
     systemPrompt: `You are a shell/scripting expert. Write robust scripts with error handling, input validation, and clear comments. Prefer POSIX compatibility unless bash-specific features are needed.${SUBAGENT_STATUS_PROTOCOL}`,
@@ -1305,6 +1627,14 @@ Violating the letter of the rules is violating the spirit of the rules.${RED_FLA
     preferredModel: 'gemini-flash',
     taskTypes: ['code', 'docs', 'test', 'debug', 'security', 'architecture', 'refactor', 'script', 'research'],
     complexityRange: [0, 10],
+  },
+  'coder-glm': {
+    systemPrompt: `You are an expert coding agent specializing in multi-file feature implementation, refactoring, and test writing. Produce complete, production-ready code. No placeholders, no TODOs, no ellipsis. Handle edge cases and error conditions.
+
+Violating the letter of the rules is violating the spirit of the rules.${SUBAGENT_STATUS_PROTOCOL}`,
+    preferredModel: 'glm-direct',
+    taskTypes: ['code', 'refactor'],
+    complexityRange: [5, 8],
   },
 };
 
@@ -1507,22 +1837,30 @@ function routeTask(score, taskType) {
   ] : [];
 
   const rules = [
+    // Score 0-2: Haiku for coding, inline for non-coding
+    { maxScore: 2, types: ['code', 'refactor', 'test', 'debug', 'script'], model: 'haiku', reason: 'Trivial coding — Haiku' },
     { maxScore: 2, types: '*',                model: 'inline',       reason: 'Trivial — handle inline' },
     ...localRules,
+    // Score 3-4: Codex for code, DeepSeek for scripts, Gemini Flash for docs
     { maxScore: 4, types: ['docs'],           model: 'gemini-flash', reason: 'Documentation — Gemini Flash (fast/cheap)' },
     { maxScore: 4, types: ['script'],         model: 'openrouter',   modelKey: 'deepseek', reason: 'Script — DeepSeek' },
-    { maxScore: 4, types: ['code', 'refactor'], model: 'codex',      reason: 'Bulk code generation — Codex' },
-    { maxScore: 6, types: ['code', 'refactor', 'test'], model: 'codex', sandbox: 'workspace-write',
-      reason: 'Feature/refactor/test — Codex (workspace-write)' },
+    { maxScore: 4, types: ['code', 'refactor', 'test'], model: 'codex', reason: 'Mid-level code — Codex' },
+    // Score 5-8: GLM 5.1 is PRIMARY for coding tasks
+    { maxScore: 8, types: ['code', 'refactor', 'test'], model: 'glm-direct',
+      reason: 'Complex code/refactor/test — GLM 5.1 (primary coding agent)' },
+    { maxScore: 8, types: ['debug'],          model: 'glm-direct',
+      reason: 'Complex debugging — GLM 5.1 (primary coding agent)' },
+    { maxScore: 8, types: ['security'],       model: 'glm-direct',
+      reason: 'Security review — GLM 5.1' },
     { maxScore: 6, types: ['docs'],           model: 'gemini-flash', reason: 'Documentation — Gemini Flash' },
     { maxScore: 6, types: ['research'],       model: 'gemini-pro',   reason: 'Research — Gemini Pro (1M context)' },
     { maxScore: 6, types: ['script'],         model: 'openrouter',   modelKey: 'deepseek', reason: 'Script — DeepSeek' },
-    { maxScore: 8, types: ['debug', 'security'], model: 'opus',      reason: 'Complex debug/security — Opus' },
     { maxScore: 8, types: ['architecture'],   model: 'opus',         reason: 'Architecture — Opus' },
     { maxScore: 8, types: ['research'],       model: 'gemini-pro',   reason: 'Deep research — Gemini Pro' },
-    { maxScore: 8, types: ['code', 'refactor', 'test'], model: 'codex', sandbox: 'workspace-write', fullAuto: true,
-      reason: 'Complex multi-file — Codex (full_auto)' },
-    { maxScore: 8,  types: ['orchestration'], model: 'opus',         reason: 'Multi-agent orchestration — Opus' },
+    { maxScore: 8, types: ['orchestration'],  model: 'opus',         reason: 'Multi-agent orchestration — Opus' },
+    // Score 9-10: Opus for coding (last resort), architecture, orchestration
+    { maxScore: 10, types: ['code', 'refactor', 'test', 'debug'], model: 'opus',
+      reason: 'Expert coding — Opus (last resort)' },
     { maxScore: 10, types: ['architecture', 'security'], model: 'opus', reason: 'Expert architecture/security — Opus' },
     { maxScore: 10, types: ['research'],      model: 'gemini-pro',   reason: 'Expert research — Gemini Pro' },
     { maxScore: 10, types: ['orchestration'], model: 'opus',         reason: 'Expert orchestration — Opus' },
@@ -1554,7 +1892,7 @@ const MCP_TOOL_RECOMMENDATIONS = {
   architecture: [
     { server: 'Ref', tool: 'ref_search_documentation', when: 'Need framework/API reference for design decisions' },
     { server: 'tavily', tool: 'tavily-search', when: 'Search architectural patterns, best practices' },
-    { server: 'claude-flow', tool: 'agent_spawn', when: 'Task benefits from multi-agent parallel execution' },
+    { server: 'ruflo', tool: 'agent_spawn', when: 'Task benefits from multi-agent parallel execution' },
   ],
   code: [
     { server: 'spacetimedb', tool: 'stdb_query_knowledge', when: 'Check for project-specific patterns/configs' },
@@ -1604,7 +1942,7 @@ function recommendMCPTools(taskType, description) {
     extras.push({ server: 'spacetimedb', tool: 'stdb_claim_handoff', when: 'Check for session handoffs' });
   }
   if (/\b(swarm|parallel agents?|multi.?agent|orchestrat)\b/.test(desc)) {
-    extras.push({ server: 'claude-flow', tool: 'swarm_init', when: 'Task benefits from swarm orchestration' });
+    extras.push({ server: 'ruflo', tool: 'swarm_init', when: 'Task benefits from swarm orchestration' });
   }
 
   const seen = new Set();
@@ -1643,7 +1981,7 @@ function buildExecutionOrder(tasks) {
 }
 
 const server = new Server(
-  { name: "multi-model-router", version: "3.1.0" },
+  { name: "multi-model-router", version: "3.2.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -1733,6 +2071,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: ["low", "medium", "high", "xhigh"],
             description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
+          },
+        },
+        required: ["prompt"],
+      },
+    },
+    {
+      name: "consult_glm",
+      description:
+        "Consult GLM 5.1 — the PRIMARY coding agent for complex code, refactoring, testing, and debugging (complexity 5-8). Uses direct Z.AI coding API with fallback to OpenRouter and Requesty. 204K input / 131K output context. The wrapper automatically prepends a 'no shell commands' guardrail to every prompt — GLM otherwise attempts to run bash from its response and gets truncated by the MCP transport; callers should still write files and run tests themselves.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "The coding task, refactor request, test writing request, or debug question",
+          },
+          context: {
+            type: "string",
+            description: "Optional additional context (code, file contents, error logs)",
+          },
+          max_tokens: {
+            type: "number",
+            description: "Maximum output tokens (default: 8192)",
+          },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level (default: high for coding tasks)",
           },
         },
         required: ["prompt"],
@@ -1846,6 +2212,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             enum: ["low", "medium", "high", "xhigh"],
             description: "Reasoning effort level — adjusts max tokens and routing (default: medium)",
           },
+        },
+        required: ["prompt"],
+      },
+    },
+    {
+      name: "consult_copilot_cli",
+      description:
+        "Delegate a task to GitHub Copilot CLI — the agentic terminal coding tool (not the HTTP API). " +
+        "Runs `copilot -p` as a subprocess. Defaults to --mode plan (safe, proposes without executing). " +
+        "Supports model selection (gpt-4o, claude-sonnet-4.6, etc.). " +
+        "Requires the `copilot` CLI on PATH (`npm install -g @github/copilot`) and a one-time `/login` done manually by the user. " +
+        "Best for: agentic coding tasks where you want Copilot's GitHub-native context; complements consult_codex.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "The task for Copilot CLI to perform." },
+          context: { type: "string", description: "Optional prior context prepended to the prompt." },
+          model: { type: "string", description: "Copilot model id (e.g. gpt-4o, gpt-4o-mini, claude-sonnet-4.6). Omit for CLI default." },
+          mode: {
+            type: "string",
+            enum: ["plan", "interactive", "autopilot"],
+            description: "plan (safe, default): propose without executing; interactive: use tools with --allow-all-tools (required for -p); autopilot: full --allow-all.",
+          },
+          timeout: { type: "number", description: "Timeout in ms (default 120000, max 600000)." },
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high", "xhigh"],
+            description: "Reasoning effort level — adjusts max tokens and routing (default: medium).",
+          },
+          max_tokens: { type: "number", description: "Max output tokens (used only by HTTP fallback; Copilot CLI ignores this)." },
         },
         required: ["prompt"],
       },
@@ -2151,11 +2547,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           bestFor: "Code generation, multilingual tasks",
         },
         {
-          name: "GLM-5 Turbo",
+          name: "GLM 5.1 (Direct API — Primary Coding Agent)",
+          id: "glm-5.1",
+          tool: "consult_glm",
+          status: GLM_API_KEY ? "AVAILABLE (Direct API)" : "UNAVAILABLE (no GLM_API_KEY — set GLM_API_KEY env var)",
+          bestFor: "PRIMARY: Complex coding (5-8), refactoring, test writing, debugging. 204K context, coding-optimized endpoint.",
+        },
+        {
+          name: "GLM-5 Turbo (OpenRouter — fallback)",
           id: OPENROUTER_MODELS.glm,
-          tool: "consult_openrouter (model='glm')",
-          status: OPENROUTER_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
-          bestFor: "General code tasks",
+          tool: "consult_openrouter (model='glm') — redirects to direct API first",
+          status: OPENROUTER_API_KEY ? "AVAILABLE (fallback)" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
+          bestFor: "Fallback for GLM direct API",
         },
         {
           name: "Minimax M2.7",
@@ -2221,6 +2624,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           tool: "consult_copilot (model='o4-mini')",
           status: COPILOT_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (set GITHUB_TOKEN or GH_TOKEN)",
           bestFor: "Reasoning-heavy tasks via GitHub Copilot",
+        },
+        {
+          name: "GitHub Copilot CLI (agentic)",
+          id: "copilot-cli",
+          tool: "consult_copilot_cli",
+          status: COPILOT_CLI_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (npm install -g @github/copilot, then `copilot` + /login)",
+          bestFor: "Agentic coding with filesystem/shell tool use; plan/agent/autopilot modes",
         },
       ];
 
@@ -2332,10 +2742,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text }] };
     }
 
+    if (name === "consult_glm") {
+      const { maxTokens } = applyEffort(args.effort || 'high', args.max_tokens || 8192);
+      const intent = classifyIntent(args.prompt);
+      const template = intent ? AGENT_TEMPLATES[intent.agent] : resolveAgentTemplate('code', 6);
+      // Baked-in output discipline: GLM's runner periodically attempts shell commands
+      // from inside its response, which the MCP wrapper truncates, producing incomplete
+      // output. Explicitly forbidding shell use in the prompt prevents this failure mode.
+      const GLM_SHELL_GUARDRAIL =
+        "IMPORTANT: Do NOT run shell commands, do NOT emit bash code blocks that call " +
+        "commands, and do NOT claim to have executed anything. Only produce the requested " +
+        "code (or other artifacts) directly in your response. The caller will write the " +
+        "files and run the tests.\n\n";
+      const guardedPrompt = GLM_SHELL_GUARDRAIL + (args.prompt || "");
+      const text = await callGLMWithFallback(
+        guardedPrompt, args.context, maxTokens,
+        template?.systemPrompt
+      );
+      return { content: [{ type: "text", text }] };
+    }
+
     if (name === "consult_openrouter") {
       const { maxTokens } = applyEffort(args.effort, args.max_tokens);
       const intent = classifyIntent(args.prompt);
       const template = intent ? AGENT_TEMPLATES[intent.agent] : resolveAgentTemplate('script', 3);
+      // Route GLM through direct API first
+      if (args.model === 'glm') {
+        const text = await callGLMWithFallback(
+          args.prompt, args.context, maxTokens,
+          template?.systemPrompt
+        );
+        return { content: [{ type: "text", text }] };
+      }
+      // Route MiniMax through direct API first (token-plan key), OpenRouter as fallback
+      if (args.model === 'minimax') {
+        const text = await callMiniMaxWithFallback(
+          args.prompt, args.context, maxTokens,
+          template?.systemPrompt
+        );
+        return { content: [{ type: "text", text }] };
+      }
       const text = await callOpenRouterWithFallback(
         args.model || "deepseek", args.prompt, args.context, maxTokens,
         template?.systemPrompt
@@ -2382,6 +2828,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const text = await callCopilotWithFallback(
         args.model || "gpt-4.1", args.prompt, args.context, maxTokens,
         template?.systemPrompt
+      );
+      return { content: [{ type: "text", text }] };
+    }
+
+    if (name === "consult_copilot_cli") {
+      if (!COPILOT_CLI_AVAILABLE) {
+        return {
+          content: [{ type: "text", text:
+            "Error: Copilot CLI not found on PATH. Install: `npm install -g @github/copilot` " +
+            "(or `brew install copilot-cli`), then run `copilot` once and `/login`." }],
+          isError: true,
+        };
+      }
+      const { maxTokens } = applyEffort(args.effort, args.max_tokens);
+      const text = await callCopilotCliWithFallback(
+        args.prompt, args.context,
+        { model: args.model, mode: args.mode, timeout: args.timeout, max_tokens: maxTokens }
       );
       return { content: [{ type: "text", text }] };
     }
@@ -2711,6 +3174,12 @@ ${requirements}
                     result = { model: 'codex', delegateTo: 'claude', prompt: taskPrompt, note: 'Codex unavailable — delegate to Claude' };
                   }
                   break;
+                case 'glm-direct':
+                  result = { model: 'glm-5.1', output: await callGLMWithFallback(taskPrompt, null, 8192, sysPrompt) };
+                  break;
+                case 'haiku':
+                  result = { model: 'haiku', delegateTo: 'claude', useModel: 'haiku', prompt: taskPrompt };
+                  break;
                 case 'opus':
                 case 'inline':
                 default:
@@ -2957,6 +3426,7 @@ if (MMR_HTTP_PORT > 0) {
           codex: CODEX_AVAILABLE,
           copilot: COPILOT_AVAILABLE,
           local: LOCAL_SERVER_INFO.available ? LOCAL_SERVER_INFO.name : false,
+          glm_direct: GLM_AVAILABLE,
           firecrawl: !!FIRECRAWL_API_KEY,
         },
         circuitBreaker: providerHealth.getStatus(),
@@ -2981,7 +3451,8 @@ if (MMR_HTTP_PORT > 0) {
         { id: 'gemini-flash', name: 'Gemini Flash 3', owned_by: 'google', available: GEMINI_CLI_AVAILABLE || !!GEMINI_API_KEY },
         { id: 'deepseek', name: 'DeepSeek V3.2', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
         { id: 'qwen', name: 'Qwen 3.6 Plus', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
-        { id: 'glm', name: 'GLM-5 Turbo', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
+        { id: 'glm-5.1', name: 'GLM 5.1 (Direct — Primary Coding)', owned_by: 'z.ai', available: GLM_AVAILABLE },
+        { id: 'glm', name: 'GLM-5 Turbo (OpenRouter fallback)', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
         { id: 'minimax', name: 'Minimax M2.7', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
         { id: 'codex', name: 'Codex CLI (gpt-5.3-codex)', owned_by: 'openai', available: CODEX_AVAILABLE },
         { id: 'copilot', name: 'GitHub Copilot', owned_by: 'github', available: COPILOT_AVAILABLE },
@@ -3038,7 +3509,7 @@ if (MMR_HTTP_PORT > 0) {
             ...(effort && { effort }),
           };
 
-          if (route.model === 'inline' || route.model === 'opus') {
+          if (route.model === 'inline' || route.model === 'opus' || route.model === 'haiku') {
             // Cannot handle inline/opus via HTTP — delegate back to caller
             return res.json({
               id, object: 'chat.completion', created,
@@ -3095,12 +3566,12 @@ if (MMR_HTTP_PORT > 0) {
     // Memory bridge endpoints (for cm/cass shims)
     app.post('/memory/store', async (req, res) => {
       const { key, value, type, namespace } = req.body;
-      res.json({ status: 'stored', key, note: 'Route to claude-flow memory_store MCP tool' });
+      res.json({ status: 'stored', key, note: 'Route to ruflo memory_store MCP tool' });
     });
 
     app.post('/memory/search', async (req, res) => {
       const { query, namespace } = req.body;
-      res.json({ status: 'search', query, note: 'Route to claude-flow memory_search MCP tool' });
+      res.json({ status: 'search', query, note: 'Route to ruflo memory_search MCP tool' });
     });
 
     // Central routing function used by the HTTP gateway
@@ -3116,8 +3587,9 @@ if (MMR_HTTP_PORT > 0) {
           return callOpenRouterWithFallback('deepseek', prompt, context, maxTokens, systemPrompt);
         case 'qwen':
           return callOpenRouterWithFallback('qwen', prompt, context, maxTokens, systemPrompt);
+        case 'glm-direct':
         case 'glm':
-          return callOpenRouterWithFallback('glm', prompt, context, maxTokens, systemPrompt);
+          return callGLMWithFallback(prompt, context, maxTokens, systemPrompt);
         case 'minimax':
           return callOpenRouterWithFallback('minimax', prompt, context, maxTokens, systemPrompt);
         case 'codex':

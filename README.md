@@ -1,6 +1,6 @@
 # mcp-multi-model-router
 
-MCP server that intelligently routes AI tasks to the optimal model (Gemini, DeepSeek, Codex, OpenRouter, Requesty, Copilot, local) using code-based complexity scoring, intent classification, agent prompt templates, and automatic fallback chains with circuit breakers.
+MCP server that intelligently routes AI tasks to the optimal model (GLM 5.1, Gemini, DeepSeek, Codex, OpenRouter, Requesty, Copilot, local) using code-based complexity scoring, intent classification, agent prompt templates, and automatic fallback chains with circuit breakers. GLM 5.1 serves as the primary coding agent for complexity 5-8 tasks via direct Z.AI API.
 
 ## What is this?
 
@@ -8,7 +8,8 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for [
 
 ## Features
 
-- **15 MCP tools** for model consultation, listing, requirements analysis, plan execution, agent templates, and quality stats
+- **16 MCP tools** for model consultation, listing, requirements analysis, plan execution, agent templates, and quality stats
+- **GLM 5.1 Direct API** — primary coding agent (complexity 5-8) via `consult_glm` with 4-tier fallback (Direct → OpenRouter → Minimax → Requesty)
 - **Intent classification** with 12+ keyword triggers for fast upfront routing (inspired by oh-my-codex)
 - **13 agent prompt templates** — specialized system prompts with behavioral governance for code-reviewer, security-auditor, debugger, architect, test-engineer, researcher, verifier, etc.
 - **Structured subagent status protocol** — agents report DONE/DONE_WITH_CONCERNS/NEEDS_CONTEXT/BLOCKED instead of free-form responses (inspired by [obra/superpowers](https://github.com/obra/superpowers))
@@ -119,7 +120,8 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json` or project `.cla
       "env": {
         "GEMINI_API_KEY": "your-gemini-api-key",
         "OPENROUTER_API_KEY": "your-openrouter-api-key",
-        "REQUESTY_API_KEY": "your-requesty-api-key"
+        "REQUESTY_API_KEY": "your-requesty-api-key",
+        "GLM_API_KEY": "your-glm-api-key"
       }
     }
   }
@@ -130,8 +132,9 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json` or project `.cla
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `GLM_API_KEY` | No* | Z.AI API key for GLM 5.1 direct coding API (primary coding agent) |
 | `GEMINI_API_KEY` | No* | Google AI Studio API key for Gemini models |
-| `OPENROUTER_API_KEY` | No* | OpenRouter API key for DeepSeek/Qwen/GLM/Minimax |
+| `OPENROUTER_API_KEY` | No* | OpenRouter API key for DeepSeek/Qwen/GLM/Minimax (GLM fallback) |
 | `REQUESTY_API_KEY` | No* | Requesty.ai API key (fallback router, 300+ models) |
 | `LOCAL_MODEL_BASE_URL` | No | Override auto-detected local server URL (e.g., `http://192.168.1.100:11434/v1`) |
 | `LOCAL_MODEL_PROVIDER` | No | Hint for auto-detection: `ollama`, `lmstudio`, `vllm`, `mlx`, or `localai` |
