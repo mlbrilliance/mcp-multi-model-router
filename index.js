@@ -11,7 +11,13 @@ import { execSync } from 'child_process';
 import { createRequire } from 'module';
 import { createHash } from 'crypto';
 import { classifyByEmbedding, primeExemplars, classifierStats } from './src/classifier/knn.js';
+import * as codexBridge from './lib/codex-bridge.js';
 const require = createRequire(import.meta.url);
+
+try { codexBridge.init(); } catch (e) {
+  console.error(`[codex-bridge] init failed: ${e.message}`);
+  // Non-fatal: bridge tools will surface a clear isError when called.
+}
 
 const ROUTER_CLASSIFIER = process.env.ROUTER_CLASSIFIER || 'shadow'; // shadow | keyword | hybrid
 
@@ -2250,6 +2256,110 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "codex_review",
+      description:
+        "Run a Codex code review against the repo's git state (working tree or branch). " +
+        "Bridges openai/codex-plugin-cc — same behavior as the /codex:review slash command, " +
+        "but invokable from any MCP client. Read-only review; never mutates files. " +
+        "Default sync (blocks <=180s); set background=true to detach and check via codex_status.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          repo_path: { type: "string", description: "Absolute path to the git repo to review. Required when MMR's cwd is not a git repo (almost always)." },
+          base: { type: "string", description: "Base ref for branch reviews (e.g. 'main'). Optional." },
+          scope: { type: "string", enum: ["auto", "working-tree", "branch"], description: "Review scope (default: auto)." },
+          background: { type: "boolean", description: "Detach and return immediately with a job pointer (default: false). Use for large reviews." },
+          timeout_ms: { type: "number", description: "Sync-mode timeout in ms (default 180000, max 600000). Ignored if background=true." },
+        },
+      },
+    },
+    {
+      name: "codex_adversarial_review",
+      description:
+        "Run a Codex review that challenges design choices, assumptions, and tradeoffs (not just defects). " +
+        "Bridges openai/codex-plugin-cc /codex:adversarial-review. Read-only; never mutates files. " +
+        "Supports an optional `focus` free-text steer (e.g. 'be skeptical of the cache invalidation strategy').",
+      inputSchema: {
+        type: "object",
+        properties: {
+          repo_path: { type: "string", description: "Absolute path to the git repo. Required when MMR's cwd is not a git repo." },
+          base: { type: "string", description: "Base ref for branch reviews. Optional." },
+          scope: { type: "string", enum: ["auto", "working-tree", "branch"], description: "Review scope (default: auto)." },
+          focus: { type: "string", description: "Free-text steering — what to push back on. Optional." },
+          background: { type: "boolean", description: "Detach and return a job pointer (default: false)." },
+          timeout_ms: { type: "number", description: "Sync-mode timeout in ms (default 180000, max 600000)." },
+        },
+      },
+    },
+    {
+      name: "codex_rescue",
+      description:
+        "Delegate a task to Codex via openai/codex-plugin-cc /codex:rescue. " +
+        "Use for: investigating bugs, applying fixes, continuing work. " +
+        "Defaults to background=true (rescue jobs are typically long-running). " +
+        "Use codex_status / codex_result to check progress and read output.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "What Codex should investigate, fix, or continue." },
+          repo_path: { type: "string", description: "Absolute path to the git repo to operate on." },
+          write: { type: "boolean", description: "Allow Codex to write files (default: read-only)." },
+          resume: { type: "boolean", description: "Resume the most recent rescue thread for this repo." },
+          fresh: { type: "boolean", description: "Force a fresh thread even if a resumable one exists." },
+          model: { type: "string", description: "Codex model name (e.g. gpt-5.3-codex, spark)." },
+          effort: { type: "string", enum: ["none", "minimal", "low", "medium", "high", "xhigh"], description: "Reasoning effort." },
+          background: { type: "boolean", description: "Detach (default: true). Set false to block and return Codex's output directly." },
+          timeout_ms: { type: "number", description: "Sync-mode timeout in ms (only when background=false)." },
+        },
+        required: ["prompt"],
+      },
+    },
+    {
+      name: "codex_status",
+      description:
+        "List active and recent Codex jobs for the given repo. " +
+        "Bridges openai/codex-plugin-cc /codex:status. " +
+        "Pass task_id to inspect a single job; pass all=true to include archived runs.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          repo_path: { type: "string", description: "Repo whose jobs to list." },
+          task_id: { type: "string", description: "Optional: inspect a single job." },
+          all: { type: "boolean", description: "Include archived jobs (default: false — current session only)." },
+          json: { type: "boolean", description: "Return JSON instead of human Markdown." },
+        },
+      },
+    },
+    {
+      name: "codex_result",
+      description:
+        "Show the stored final output for a finished Codex job (review or rescue). " +
+        "Bridges openai/codex-plugin-cc /codex:result.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "Job ID returned by codex_review/adversarial_review/rescue or shown in codex_status." },
+          repo_path: { type: "string", description: "Repo the job belongs to." },
+          json: { type: "boolean", description: "Return JSON instead of human Markdown." },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "codex_cancel",
+      description:
+        "Cancel an active background Codex job. Bridges openai/codex-plugin-cc /codex:cancel.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "Job ID to cancel." },
+          repo_path: { type: "string", description: "Repo the job belongs to." },
+          json: { type: "boolean", description: "Return JSON instead of human Markdown." },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
       name: "consult_copilot",
       description:
         "Consult GitHub Copilot API. Access GPT-5.4, GPT-4.1, Claude Sonnet 4.6, Claude Opus 4.6, o4-mini, and Gemini 3 Flash/Pro through GitHub's Copilot infrastructure. Requires GITHUB_TOKEN or GH_TOKEN. Best for: code completion, code review, quick code tasks using GitHub-hosted models.",
@@ -2903,6 +3013,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         { model: args.model, sandbox: args.sandbox, fullAuto: args.full_auto, timeout: args.timeout, max_tokens: maxTokens }
       );
       return { content: [{ type: "text", text }] };
+    }
+
+    // --- codex-plugin-cc bridge tools ---
+    // No model fallback for these (locked decision): substituting another model
+    // would lie about provenance — the caller asked for Codex specifically.
+    if (name === "codex_review" || name === "codex_adversarial_review" || name === "codex_rescue" ||
+        name === "codex_status" || name === "codex_result" || name === "codex_cancel") {
+      if (!CODEX_AVAILABLE) {
+        return {
+          content: [{ type: "text", text:
+            "Error: Codex CLI not found on PATH. Install and authenticate: `codex login`. " +
+            "These tools bridge openai/codex-plugin-cc and require the codex binary." }],
+          isError: true,
+        };
+      }
+      try {
+        // Track Codex usage in router_stats but do not fall back on failure.
+        const t0 = Date.now();
+        let text;
+        switch (name) {
+          case "codex_review":              text = await codexBridge.codexReview(args); break;
+          case "codex_adversarial_review":  text = await codexBridge.codexAdversarialReview(args); break;
+          case "codex_rescue":              text = await codexBridge.codexRescue(args); break;
+          case "codex_status":              text = await codexBridge.codexStatus(args); break;
+          case "codex_result":              text = await codexBridge.codexResult(args); break;
+          case "codex_cancel":              text = await codexBridge.codexCancel(args); break;
+        }
+        providerHealth.recordSuccess('codex');
+        qualityTracker.record(name, null, true, Date.now() - t0);
+        return { content: [{ type: "text", text }] };
+      } catch (err) {
+        providerHealth.recordFailure('codex');
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+      }
     }
 
     if (name === "consult_copilot") {
