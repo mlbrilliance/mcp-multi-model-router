@@ -8,7 +8,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for [
 
 ## Features
 
-- **16 MCP tools** for model consultation, listing, requirements analysis, plan execution, agent templates, and quality stats
+- **22 MCP tools** for model consultation, listing, requirements analysis, plan execution, agent templates, quality stats, and the codex-plugin-cc bridge (6 tools)
 - **GLM 5.1 Direct API** — primary coding agent (complexity 5-8) via `consult_glm` with 4-tier fallback (Direct → OpenRouter → Minimax → Requesty)
 - **Intent classification** with 12+ keyword triggers for fast upfront routing (inspired by oh-my-codex)
 - **13 agent prompt templates** — specialized system prompts with behavioral governance for code-reviewer, security-auditor, debugger, architect, test-engineer, researcher, verifier, etc.
@@ -301,6 +301,37 @@ Delegate a task to OpenAI Codex CLI for autonomous execution with its own agent 
 | `sandbox` | string | No | `read-only` (default) or `workspace-write` |
 | `full_auto` | boolean | No | Enable full-auto mode (no approval prompts) |
 | `timeout` | number | No | Timeout in ms (default: 120000, max: 600000) |
+
+### Codex Plugin Bridge — `codex_review`, `codex_adversarial_review`, `codex_rescue`, `codex_status`, `codex_result`, `codex_cancel`
+
+Six tools that bridge [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) into MMR so its slash-commands can be invoked from any MCP client (Codex CLI, GLM, scripts, cron, other Claude sessions) — not just inside the Claude Code TUI. Auth uses your existing local `codex` CLI; no new credentials.
+
+The upstream plugin is a self-contained Node subsystem; we vendor `plugins/codex/` into `vendor/codex-plugin-cc/` (pinned via `UPSTREAM_SHA`) and shell out to its companion script. Job tracking, prompts, and Codex orchestration all live upstream — these tools add only MCP wrapping, `repo_path` resolution, and detached-spawn semantics for background mode.
+
+**No model fallback.** If `codex` CLI is missing, these tools return a clear error rather than silently substituting another provider — substituting would lie about review provenance.
+
+| Tool | Purpose | Required args |
+|---|---|---|
+| `codex_review` | Read-only Codex review of working tree or branch | — |
+| `codex_adversarial_review` | Review that challenges design choices and assumptions; supports free-text `focus` | — |
+| `codex_rescue` | Delegate work (investigate / fix / continue); defaults to background | `prompt` |
+| `codex_status` | List active/recent Codex jobs in a repo | — |
+| `codex_result` | Retrieve stored output for a finished job | `task_id` |
+| `codex_cancel` | Cancel an active background job | `task_id` |
+
+Common args:
+- `repo_path` (string) — absolute path to the git repo. Required when MMR's cwd is not itself a git repo (almost always). Never silently falls back to MMR's cwd.
+- `background` (boolean) — for `_review` / `_adversarial_review` defaults `false` (sync, ≤180s); for `_rescue` defaults `true`.
+- `base`, `scope`, `focus`, `model`, `effort`, `write`, `resume`, `fresh`, `task_id`, `all`, `json` — passed through to the upstream companion script.
+
+Companion script lives at `vendor/codex-plugin-cc/scripts/codex-companion.mjs`. Refresh the vendored subtree any time:
+
+```bash
+npm run sync-codex-prompts             # latest main
+npm run sync-codex-prompts -- <sha>    # pin a specific commit
+```
+
+Slash-command shortcuts (optional convenience): six one-line markdown shims at `~/.claude/commands/cdx/{review,adversarial-review,rescue,status,result,cancel}.md` re-expose the tools as `/cdx:review`, `/cdx:rescue`, etc. Namespaced under `/cdx:` to avoid colliding with the official `/codex:` plugin if both are installed.
 
 ### `consult_local`
 

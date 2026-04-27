@@ -5,7 +5,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "sync-codex-prompts": "node scripts/sync-codex-prompts.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
