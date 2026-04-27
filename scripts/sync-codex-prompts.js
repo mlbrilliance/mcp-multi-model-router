@@ -26,7 +26,7 @@ const GIT_SHA_RE = /^[0-9a-fA-F]{7,64}$/;
 
 function git(...args) {
   const r = spawnSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
-  if (r.status !== 0) throw new Error(`git ${args[0]} failed (exit ${r.status})`);
+  if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed (exit ${r.status})`);
   return (r.stdout || '').trim();
 }
 
