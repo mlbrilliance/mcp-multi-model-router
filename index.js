@@ -471,7 +471,7 @@ async function callGemini(modelName, prompt, context, maxTokens, systemPrompt) {
   const parts = [systemPrompt, context, prompt].filter(Boolean);
   const fullPrompt = parts.join('\n\n---\n\n');
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
 
   const body = {
     contents: [{ parts: [{ text: fullPrompt }] }],
@@ -482,7 +482,10 @@ async function callGemini(modelName, prompt, context, maxTokens, systemPrompt) {
 
   const response = await fetchWithTimeout(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": GEMINI_API_KEY,
+    },
     body: JSON.stringify(body),
   }, 60000);
 
@@ -504,10 +507,15 @@ async function callGeminiCLI(cliModel, prompt, context, maxTokens, systemPrompt)
   const fullPrompt = parts.join('\n\n---\n\n');
   const args = ['-p', fullPrompt, '-m', cliModel || 'auto', '-o', 'json', '-y'];
 
-  // Strip GEMINI_API_KEY so CLI uses OAuth instead of API key
-  const childEnv = { ...process.env };
-  delete childEnv.GEMINI_API_KEY;
-  delete childEnv.GOOGLE_API_KEY;
+  // Build a minimal environment: only pass variables needed for CLI auth and system operation.
+  // Deliberately exclude all provider API keys to prevent accidental exposure to the subprocess.
+  // GEMINI_API_KEY and GOOGLE_API_KEY are intentionally omitted so the CLI uses OAuth.
+  const SAFE_ENV_VARS = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM',
+    'TMPDIR', 'TMP', 'TEMP', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'];
+  const childEnv = {};
+  for (const key of SAFE_ENV_VARS) {
+    if (process.env[key] !== undefined) childEnv[key] = process.env[key];
+  }
 
   return new Promise((resolve, reject) => {
     const proc = spawnProcess(GEMINI_CLI_PATH, args, {
