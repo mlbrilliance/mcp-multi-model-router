@@ -1,6 +1,6 @@
 # mcp-multi-model-router
 
-MCP server that intelligently routes AI tasks to the optimal model (GLM 5.1, Gemini, DeepSeek, Codex, OpenRouter, Requesty, Copilot, local) using code-based complexity scoring, intent classification, agent prompt templates, and automatic fallback chains with circuit breakers. GLM 5.1 serves as the primary coding agent for complexity 5-8 tasks via direct Z.AI API.
+MCP server that intelligently routes AI tasks to the optimal model (Codex CLI, GLM 5.1, Gemini, DeepSeek, OpenRouter, Requesty, Copilot, local) using code-based complexity scoring, intent classification, agent prompt templates, and automatic fallback chains with circuit breakers. OpenAI Codex CLI serves as the primary coding agent for complexity 3-8 tasks via OpenAI auth; GLM 5.1 is the fallback coding agent and primary security reviewer.
 
 ## What is this?
 
@@ -9,7 +9,9 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for [
 ## Features
 
 - **22 MCP tools** for model consultation, listing, requirements analysis, plan execution, agent templates, quality stats, and the codex-plugin-cc bridge (6 tools)
-- **GLM 5.1 Direct API** — primary coding agent (complexity 5-8) via `consult_glm` with 4-tier fallback (Direct → OpenRouter → Minimax → Requesty)
+- **OpenAI Codex CLI** — primary coding agent (complexity 3-8) via `consult_codex` using OpenAI auth (no API key billing); local autonomous agent with sandbox
+- **GLM 5.1 Direct API** — fallback coding agent and primary for security review at complexity 5-8 via `consult_glm` with 4-tier fallback (Direct → OpenRouter → Minimax → Requesty)
+- **DeepSeek v4-pro (Coder)** — third coding rung in the escalation ladder via `consult_openrouter(model='deepseek-coder')`; separate circuit-breaker bucket from `deepseek` (v4-flash, script-tier)
 - **Intent classification** with 12+ keyword triggers for fast upfront routing (inspired by oh-my-codex)
 - **13 agent prompt templates** — specialized system prompts with behavioral governance for code-reviewer, security-auditor, debugger, architect, test-engineer, researcher, verifier, etc.
 - **Structured subagent status protocol** — agents report DONE/DONE_WITH_CONCERNS/NEEDS_CONTEXT/BLOCKED instead of free-form responses (inspired by [obra/superpowers](https://github.com/obra/superpowers))
@@ -132,7 +134,7 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json` or project `.cla
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GLM_API_KEY` | No* | Z.AI API key for GLM 5.1 direct coding API (primary coding agent) |
+| `GLM_API_KEY` | No* | Z.AI API key for GLM 5.1 direct coding API (fallback coding agent / primary security review) |
 | `GEMINI_API_KEY` | No* | Google AI Studio API key for Gemini models |
 | `OPENROUTER_API_KEY` | No* | OpenRouter API key for DeepSeek/Qwen/GLM/Minimax (GLM fallback) |
 | `REQUESTY_API_KEY` | No* | Requesty.ai API key (fallback router, 300+ models) |
@@ -193,6 +195,9 @@ consult_codex:
   1. Codex CLI (local)
   2. Requesty.ai (deepseek)
   3. { delegateTo: 'claude' }
+
+Coding escalation ladder (auto-failover when a coding rung breaks):
+  Codex CLI → GLM 5.1 → DeepSeek v4-pro (Coder) → Sonnet (inline) → Gemini Pro → Opus
 
 consult_requesty:
   1. Requesty.ai (direct)

@@ -6,7 +6,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "sync-codex-prompts": "node scripts/sync-codex-prompts.js"
+    "sync-codex-prompts": "node scripts/sync-codex-prompts.js",
+    "check-models": "node scripts/check-latest-models.js --dry-run",
+    "test": "node tests/escalation.test.js && node tests/check-latest-models.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

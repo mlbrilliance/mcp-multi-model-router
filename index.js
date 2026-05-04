@@ -12,6 +12,7 @@ import { createRequire } from 'module';
 import { createHash } from 'crypto';
 import { classifyByEmbedding, primeExemplars, classifierStats } from './src/classifier/knn.js';
 import * as codexBridge from './lib/codex-bridge.js';
+import { OPENROUTER_MODELS, REQUESTY_MODELS, COPILOT_MODELS, DIRECT_MODELS } from './lib/models-dicts.js';
 const require = createRequire(import.meta.url);
 
 try { codexBridge.init(); } catch (e) {
@@ -114,33 +115,8 @@ const LOCAL_SERVER_INFO = await (async () => {
   return unavailable;
 })();
 
-const OPENROUTER_MODELS = {
-  deepseek: "deepseek/deepseek-v3.2",
-  qwen: "qwen/qwen3.6-plus:free",
-  glm: "z-ai/glm-5-turbo",
-  minimax: "minimax/minimax-m2.7",
-};
-
-const REQUESTY_MODELS = {
-  deepseek: "fireworks/deepseek-v3.2",
-  qwen: "alibaba/qwen-plus",
-  glm: "zai/GLM-5",
-  minimax: "minimaxi/MiniMax-M2.7",
-  "gemini-pro": "google/gemini-3.1-pro-preview",
-  "gemini-flash": "google/gemini-3-flash-preview",
-};
-
-const COPILOT_MODELS = {
-  "gpt-4.1": "gpt-4.1",
-  "gpt-4.1-mini": "gpt-4.1-mini",
-  "gpt-5.4": "gpt-5.4",
-  "gpt-5.4-mini": "gpt-5.4-mini",
-  "claude-sonnet": "claude-sonnet-4.6",
-  "claude-opus": "claude-opus-4.6",
-  "o4-mini": "o4-mini",
-  "gemini": "gemini-3-flash",
-  "gemini-pro": "gemini-3.1-pro",
-};
+// Model-ID dicts live in lib/models-dicts.js (single source of truth for the
+// autonomous updater). Imported above; intentionally not redeclared here.
 
 const COPILOT_AVAILABLE = !!GITHUB_COPILOT_TOKEN;
 
@@ -320,7 +296,7 @@ if (GLM_API_KEY) {
           Authorization: `Bearer ${GLM_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "glm-5.1",
+          model: DIRECT_MODELS["glm-direct"],
           messages: [{ role: "user", content: "Hi" }],
           max_tokens: 16,
         }),
@@ -354,7 +330,7 @@ if (MINIMAX_API_KEY) {
           Authorization: `Bearer ${MINIMAX_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "MiniMax-M2.7",
+          model: DIRECT_MODELS["minimax-direct"],
           messages: [{ role: "user", content: "Hi" }],
           max_tokens: 16,
         }),
@@ -670,7 +646,7 @@ async function callGLM(prompt, context, maxTokens, systemPrompt) {
       Authorization: `Bearer ${GLM_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "glm-5.1",
+      model: DIRECT_MODELS["glm-direct"],
       messages,
       max_tokens: maxTokens || 8192,
     }),
@@ -703,7 +679,7 @@ async function callMiniMax(prompt, context, maxTokens, systemPrompt) {
       Authorization: `Bearer ${MINIMAX_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "MiniMax-M2.7",
+      model: DIRECT_MODELS["minimax-direct"],
       messages,
       max_tokens: maxTokens || 8192,
     }),
@@ -758,39 +734,41 @@ function makeDelegateResponse(prompt, context, failureReason) {
 }
 
 async function callOpenRouterWithFallback(modelKey, prompt, context, maxTokens, systemPrompt) {
-  const cached = responseCache.get(`openrouter:${modelKey}`, prompt, context);
+  const bucket = `openrouter:${modelKey}`;
+  const cached = responseCache.get(bucket, prompt, context);
   if (cached) return cached;
   const errors = [];
   const t0 = Date.now();
-  if (OPENROUTER_API_KEY && providerHealth.isAvailable('openrouter')) {
+  if (OPENROUTER_API_KEY && providerHealth.isAvailable(bucket)) {
     try {
       const result = await callOpenRouter(modelKey, prompt, context, maxTokens, systemPrompt);
-      responseCache.set(`openrouter:${modelKey}`, prompt, context, result);
-      providerHealth.recordSuccess('openrouter');
-      qualityTracker.record(`openrouter:${modelKey}`, null, true, Date.now() - t0);
+      responseCache.set(bucket, prompt, context, result);
+      providerHealth.recordSuccess(bucket);
+      qualityTracker.record(bucket, null, true, Date.now() - t0);
       return result;
     } catch (err) {
       errors.push(`OpenRouter(${modelKey}): ${err.message}`);
-      providerHealth.recordFailure('openrouter');
+      providerHealth.recordFailure(bucket);
       if (modelKey === "glm") {
         try {
           const result = await callOpenRouter("minimax", prompt, context, maxTokens, systemPrompt);
-          responseCache.set(`openrouter:${modelKey}`, prompt, context, result);
+          responseCache.set(bucket, prompt, context, result);
           return result;
         } catch (err2) { errors.push(`OpenRouter(minimax backup): ${err2.message}`); }
       }
     }
   }
-  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
+  if (REQUESTY_API_KEY && providerHealth.isAvailable(`requesty:${modelKey || 'deepseek'}`)) {
     try {
       const reqModelKey = modelKey || "deepseek";
+      const reqBucket = `requesty:${reqModelKey}`;
       const result = await callRequesty(reqModelKey, prompt, context, maxTokens, systemPrompt);
-      responseCache.set(`openrouter:${modelKey}`, prompt, context, result);
-      providerHealth.recordSuccess('requesty');
+      responseCache.set(bucket, prompt, context, result);
+      providerHealth.recordSuccess(reqBucket);
       return result;
-    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure(`requesty:${modelKey || 'deepseek'}`); }
   }
-  qualityTracker.record(`openrouter:${modelKey}`, null, false, Date.now() - t0);
+  qualityTracker.record(bucket, null, false, Date.now() - t0);
   return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
@@ -914,20 +892,21 @@ async function callGeminiWithFallback(modelName, prompt, context, maxTokens, sys
 }
 
 async function callRequestyWithFallback(modelKey, prompt, context, maxTokens, systemPrompt) {
-  const cached = responseCache.get(`requesty:${modelKey}`, prompt, context);
+  const bucket = `requesty:${modelKey}`;
+  const cached = responseCache.get(bucket, prompt, context);
   if (cached) return cached;
   const errors = [];
   const t0 = Date.now();
-  if (REQUESTY_API_KEY && providerHealth.isAvailable('requesty')) {
+  if (REQUESTY_API_KEY && providerHealth.isAvailable(bucket)) {
     try {
       const result = await callRequesty(modelKey, prompt, context, maxTokens, systemPrompt);
-      responseCache.set(`requesty:${modelKey}`, prompt, context, result);
-      providerHealth.recordSuccess('requesty');
-      qualityTracker.record(`requesty:${modelKey}`, null, true, Date.now() - t0);
+      responseCache.set(bucket, prompt, context, result);
+      providerHealth.recordSuccess(bucket);
+      qualityTracker.record(bucket, null, true, Date.now() - t0);
       return result;
-    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure('requesty'); }
+    } catch (err) { errors.push(`Requesty: ${err.message}`); providerHealth.recordFailure(bucket); }
   }
-  qualityTracker.record(`requesty:${modelKey}`, null, false, Date.now() - t0);
+  qualityTracker.record(bucket, null, false, Date.now() - t0);
   return makeDelegateResponse(prompt, context, formatErrors(errors));
 }
 
@@ -1113,14 +1092,15 @@ function pickVerifier(executionProvider) {
 // After repeated failures, escalate to more capable models instead of retrying the same one.
 
 const ESCALATION_LADDER = {
-  'local':        ['glm-direct', 'openrouter', 'gemini-flash', 'gemini-pro', 'opus'],
-  'glm-direct':   ['codex', 'gemini-pro', 'opus'],
-  'openrouter':   ['glm-direct', 'gemini-flash', 'gemini-pro', 'copilot', 'opus'],
-  'gemini-flash': ['gemini-pro', 'copilot', 'opus'],
-  'gemini-pro':   ['copilot', 'opus'],
-  'copilot':      ['glm-direct', 'gemini-pro', 'opus'],
-  'codex':        ['glm-direct', 'gemini-pro', 'opus'],
-  'requesty':     ['glm-direct', 'gemini-pro', 'opus'],
+  'local':           ['glm-direct', 'deepseek-coder', 'openrouter', 'gemini-flash', 'gemini-pro', 'opus'],
+  'glm-direct':      ['deepseek-coder', 'codex', 'gemini-pro', 'opus'],
+  'openrouter':      ['codex', 'glm-direct', 'deepseek-coder', 'gemini-flash', 'gemini-pro', 'copilot', 'opus'],
+  'gemini-flash':    ['gemini-pro', 'copilot', 'opus'],
+  'gemini-pro':      ['copilot', 'opus'],
+  'copilot':         ['codex', 'glm-direct', 'deepseek-coder', 'gemini-pro', 'opus'],
+  'codex':           ['glm-direct', 'deepseek-coder', 'gemini-pro', 'opus'],
+  'deepseek-coder':  ['glm-direct', 'codex', 'gemini-pro', 'opus'],
+  'requesty':        ['codex', 'glm-direct', 'deepseek-coder', 'gemini-pro', 'opus'],
 };
 
 function getEscalationTarget(currentProvider, failCount) {
@@ -1226,15 +1206,16 @@ function parseVerification(text) {
 
 async function callProvider(provider, model, prompt, context, maxTokens, sysPrompt) {
   switch (provider) {
-    case 'gemini-pro': return await callGeminiWithFallback('gemini-3.1-pro-preview', prompt, context, maxTokens, sysPrompt);
-    case 'gemini-flash': return await callGeminiWithFallback('gemini-3-flash-preview', prompt, context, maxTokens, sysPrompt);
+    case 'gemini-pro': return await callGeminiWithFallback(DIRECT_MODELS["gemini-pro-cli"], prompt, context, maxTokens, sysPrompt);
+    case 'gemini-flash': return await callGeminiWithFallback(DIRECT_MODELS["gemini-flash-cli"], prompt, context, maxTokens, sysPrompt);
     case 'glm-direct': return await callGLMWithFallback(prompt, context, maxTokens, sysPrompt);
     case 'openrouter': return await callOpenRouterWithFallback(model || 'deepseek', prompt, context, maxTokens, sysPrompt);
+    case 'deepseek-coder': return await callOpenRouterWithFallback('deepseek-coder', prompt, context, maxTokens, sysPrompt);
     case 'copilot': return await callCopilotWithFallback(model || 'gpt-4.1', prompt, context, maxTokens, sysPrompt);
     case 'codex': return await callCodexWithFallback(prompt, context, { max_tokens: maxTokens });
     case 'requesty': return await callRequestyWithFallback(model || 'deepseek', prompt, context, maxTokens, sysPrompt);
     case 'local': return await callLocalWithFallback(model, prompt, context, maxTokens, sysPrompt);
-    default: return await callGeminiWithFallback('gemini-3.1-pro-preview', prompt, context, maxTokens, sysPrompt);
+    default: return await callGeminiWithFallback(DIRECT_MODELS["gemini-pro-cli"], prompt, context, maxTokens, sysPrompt);
   }
 }
 
@@ -1548,7 +1529,7 @@ const AGENT_TEMPLATES = {
     systemPrompt: `You are an expert code reviewer. Focus on correctness, edge cases, performance, and maintainability. Be specific about line-level issues. Flag potential bugs, suggest improvements.
 
 Violating the letter of the rules is violating the spirit of the rules.${SUBAGENT_STATUS_PROTOCOL}`,
-    preferredModel: 'glm-direct',
+    preferredModel: 'codex',
     taskTypes: ['code', 'refactor'],
     complexityRange: [5, 8],
   },
@@ -1578,7 +1559,7 @@ Violating the letter of the rules is violating the spirit of the rules.${RED_FLA
     systemPrompt: `You are a test engineer. Write thorough tests covering happy paths, edge cases, error conditions, and boundary values. Structure tests clearly with arrange-act-assert pattern.
 
 Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS['test-engineer']}${SUBAGENT_STATUS_PROTOCOL}`,
-    preferredModel: 'glm-direct',
+    preferredModel: 'codex',
     taskTypes: ['test'],
     complexityRange: [5, 8],
   },
@@ -1602,7 +1583,7 @@ If >= 3 fix attempts: STOP. Question the architecture. Pattern indicators of sys
   - Each fix creates new symptoms elsewhere
 
 Violating the letter of the rules is violating the spirit of the rules.${RED_FLAGS.debugger}${SUBAGENT_STATUS_PROTOCOL}`,
-    preferredModel: 'glm-direct',
+    preferredModel: 'codex',
     taskTypes: ['debug'],
     complexityRange: [5, 8],
   },
@@ -1672,11 +1653,11 @@ Violating the letter of the rules is violating the spirit of the rules.${RED_FLA
     taskTypes: ['code', 'docs', 'test', 'debug', 'security', 'architecture', 'refactor', 'script', 'research'],
     complexityRange: [0, 10],
   },
-  'coder-glm': {
+  'coder-codex': {
     systemPrompt: `You are an expert coding agent specializing in multi-file feature implementation, refactoring, and test writing. Produce complete, production-ready code. No placeholders, no TODOs, no ellipsis. Handle edge cases and error conditions.
 
 Violating the letter of the rules is violating the spirit of the rules.${SUBAGENT_STATUS_PROTOCOL}`,
-    preferredModel: 'glm-direct',
+    preferredModel: 'codex',
     taskTypes: ['code', 'refactor'],
     complexityRange: [5, 8],
   },
@@ -1927,11 +1908,11 @@ function routeTask(score, taskType) {
     { maxScore: 4, types: ['docs'],           model: 'gemini-flash', reason: 'Documentation — Gemini Flash (fast/cheap)' },
     { maxScore: 4, types: ['script'],         model: 'openrouter',   modelKey: 'deepseek', reason: 'Script — DeepSeek' },
     { maxScore: 4, types: ['code', 'refactor', 'test'], model: 'codex', reason: 'Mid-level code — Codex' },
-    // Score 5-8: GLM 5.1 is PRIMARY for coding tasks
-    { maxScore: 8, types: ['code', 'refactor', 'test'], model: 'glm-direct',
-      reason: 'Complex code/refactor/test — GLM 5.1 (primary coding agent)' },
-    { maxScore: 8, types: ['debug'],          model: 'glm-direct',
-      reason: 'Complex debugging — GLM 5.1 (primary coding agent)' },
+    // Score 5-8: Codex CLI is PRIMARY for coding tasks (OpenAI auth)
+    { maxScore: 8, types: ['code', 'refactor', 'test'], model: 'codex',
+      reason: 'Complex code/refactor/test — Codex CLI (primary coding agent)' },
+    { maxScore: 8, types: ['debug'],          model: 'codex',
+      reason: 'Complex debugging — Codex CLI (primary coding agent)' },
     { maxScore: 8, types: ['security'],       model: 'glm-direct',
       reason: 'Security review — GLM 5.1' },
     { maxScore: 6, types: ['docs'],           model: 'gemini-flash', reason: 'Documentation — Gemini Flash' },
@@ -2128,7 +2109,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "consult_openrouter",
       description:
-        "Consult an OpenRouter model (DeepSeek, Qwen, GLM, or Minimax) for bash scripts, boilerplate code, simple CRUD, and repetitive low-effort tasks. Use model='deepseek' (default), 'qwen', 'glm', or 'minimax'.",
+        "Consult an OpenRouter model. Tiers: 'deepseek' (v4-flash, script/boilerplate), 'deepseek-coder' (v4-pro, coding fallback rung after Codex+GLM in escalation ladder), 'qwen' (qwen3.6-max-preview, multilingual code), 'glm' (5.1, GLM fallback), 'minimax' (long-form). Default 'deepseek' for cheap script work; use 'deepseek-coder' for coding/refactor/test/debug at complexity 5-8 when Codex and GLM are unavailable.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2138,8 +2119,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           model: {
             type: "string",
-            enum: ["deepseek", "qwen", "glm", "minimax"],
-            description: "Which OpenRouter model to use (default: deepseek)",
+            enum: ["deepseek", "deepseek-coder", "qwen", "glm", "minimax"],
+            description: "Which OpenRouter model to use (default: deepseek). Use 'deepseek-coder' for coding tasks (v4-pro); 'deepseek' for cheap scripts (v4-flash).",
           },
           context: {
             type: "string",
@@ -2161,7 +2142,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "consult_glm",
       description:
-        "Consult GLM 5.1 — the PRIMARY coding agent for complex code, refactoring, testing, and debugging (complexity 5-8). Uses direct Z.AI coding API with fallback to OpenRouter and Requesty. 204K input / 131K output context. The wrapper automatically prepends a 'no shell commands' guardrail to every prompt — GLM otherwise attempts to run bash from its response and gets truncated by the MCP transport; callers should still write files and run tests themselves.",
+        "Consult GLM 5.1 — fallback coding agent (primary is consult_codex) and primary for security review at complexity 5-8. Uses direct Z.AI coding API with fallback to OpenRouter and Requesty. 204K input / 131K output context. The wrapper automatically prepends a 'no shell commands' guardrail to every prompt — GLM otherwise attempts to run bash from its response and gets truncated by the MCP transport; callers should still write files and run tests themselves.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2200,7 +2181,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           model: {
             type: "string",
             description:
-              "Model identifier: shorthand (deepseek, qwen, glm, minimax, gemini-pro, gemini-flash) or full provider/model-name (default: deepseek)",
+              "Model identifier: shorthand (deepseek, deepseek-coder, qwen, glm, minimax, gemini-pro, gemini-flash) or full provider/model-name (default: deepseek). Use 'deepseek-coder' for coding tasks (v4-pro)."
           },
           context: {
             type: "string",
@@ -2222,7 +2203,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "consult_codex",
       description:
-        "Delegate a task to OpenAI Codex CLI for autonomous execution. Codex runs locally with its own agent, skills, and sandbox. Best for: large refactors, feature implementation, bulk code generation, tasks benefiting from Codex's proprietary agent loop. Requires Codex CLI authenticated on this machine.",
+        "Consult OpenAI Codex CLI — the PRIMARY coding agent for code, refactor, test, and debug tasks at complexity 3-8. Runs locally with its own agent, skills, and sandbox via OpenAI auth (no API key billing). Best for: feature implementation, multi-file refactors, test writing, debugging, autonomous multi-step tasks. Requires Codex CLI authenticated on this machine (`codex login`).",
       inputSchema: {
         type: "object",
         properties: {
@@ -2706,41 +2687,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         },
         {
           name: "Gemini 3.1 Pro Preview",
-          id: "gemini-3.1-pro-preview",
+          id: DIRECT_MODELS["gemini-pro-cli"],
           tool: "consult_gemini_pro",
           status: geminiStatus,
           bestFor: "Complex research, massive context (1M tokens), cross-domain analysis",
         },
         {
-          name: "Gemini Flash 3",
-          id: "gemini-3-flash-preview",
+          name: "Gemini 3.1 Flash Lite Preview",
+          id: DIRECT_MODELS["gemini-flash-cli"],
           tool: "consult_gemini_flash",
           status: geminiStatus,
           bestFor: "Documentation, READMEs, JSDoc, config files, simple transforms",
         },
         {
-          name: "DeepSeek V3.2",
+          name: "DeepSeek V4 Flash",
           id: OPENROUTER_MODELS.deepseek,
           tool: "consult_openrouter (model='deepseek')",
           status: OPENROUTER_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
           bestFor: "Bash scripts, boilerplate, simple CRUD, repetitive code",
         },
         {
-          name: "Qwen 3.6 Plus",
+          name: "DeepSeek V4 Pro (Coder — Coding Fallback After GLM)",
+          id: OPENROUTER_MODELS["deepseek-coder"],
+          tool: "consult_openrouter (model='deepseek-coder')",
+          status: OPENROUTER_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
+          bestFor: "Coding rung in escalation ladder after Codex + GLM 5.1. Multi-file features, refactors, debugging.",
+        },
+        {
+          name: "Qwen 3.6 Max Preview",
           id: OPENROUTER_MODELS.qwen,
           tool: "consult_openrouter (model='qwen')",
           status: OPENROUTER_API_KEY ? "AVAILABLE" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
-          bestFor: "Code generation, multilingual tasks",
+          bestFor: "Code generation, multilingual tasks (paid flagship tier)",
         },
         {
-          name: "GLM 5.1 (Direct API — Primary Coding Agent)",
-          id: "glm-5.1",
+          name: "GLM 5.1 (Direct API — Fallback Coding Agent / Primary Security Review)",
+          id: DIRECT_MODELS["glm-direct"],
           tool: "consult_glm",
           status: GLM_API_KEY ? "AVAILABLE (Direct API)" : "UNAVAILABLE (no GLM_API_KEY — set GLM_API_KEY env var)",
-          bestFor: "PRIMARY: Complex coding (5-8), refactoring, test writing, debugging. 204K context, coding-optimized endpoint.",
+          bestFor: "Fallback for coding (primary is Codex CLI) and primary for security review at complexity 5-8. 204K context, coding-optimized endpoint.",
         },
         {
-          name: "GLM-5 Turbo (OpenRouter — fallback)",
+          name: "GLM 5.1 (OpenRouter — fallback)",
           id: OPENROUTER_MODELS.glm,
           tool: "consult_openrouter (model='glm') — redirects to direct API first",
           status: OPENROUTER_API_KEY ? "AVAILABLE (fallback)" : "UNAVAILABLE (no OPENROUTER_API_KEY)",
@@ -2767,11 +2755,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const codexModels = [
         {
-          name: "OpenAI Codex CLI (Local Agent)",
+          name: "OpenAI Codex CLI (Local Agent — Primary Coding Agent)",
           id: "codex-local",
           tool: "consult_codex",
-          status: CODEX_AVAILABLE ? "AVAILABLE" : "UNAVAILABLE (run: npm i -g @openai/codex && codex login)",
-          bestFor: "Feature implementation, large refactors, bulk code generation, autonomous multi-step tasks",
+          status: CODEX_AVAILABLE ? "AVAILABLE (OpenAI auth)" : "UNAVAILABLE (run: npm i -g @openai/codex && codex login)",
+          bestFor: "PRIMARY: Code, refactor, test, debug at complexity 3-8. Feature implementation, large refactors, bulk code generation, autonomous multi-step tasks via OpenAI auth.",
         },
       ];
 
@@ -2926,7 +2914,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { maxTokens } = applyEffort(args.effort, args.max_tokens);
       const template = resolveAgentTemplate('research', 7);
       const text = await callGeminiWithFallback(
-        "gemini-3.1-pro-preview", args.prompt, args.context, maxTokens,
+        DIRECT_MODELS["gemini-pro-cli"], args.prompt, args.context, maxTokens,
         template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
@@ -2936,7 +2924,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { maxTokens } = applyEffort(args.effort, args.max_tokens || 4096);
       const template = resolveAgentTemplate('docs', 3);
       const text = await callGeminiWithFallback(
-        "gemini-3-flash-preview", args.prompt, args.context, maxTokens,
+        DIRECT_MODELS["gemini-flash-cli"], args.prompt, args.context, maxTokens,
         template?.systemPrompt
       );
       return { content: [{ type: "text", text }] };
@@ -3237,7 +3225,7 @@ ${requirements}
       let subtasks;
       try {
         const rawResponse = await callGeminiWithFallback(
-          'gemini-3-flash-preview',
+          DIRECT_MODELS["gemini-flash-cli"],
           decompositionPrompt,
           context,
           4096
@@ -3375,13 +3363,16 @@ ${requirements}
 
               switch (task.route.model) {
                 case 'gemini-flash':
-                  result = { model: 'gemini-flash', output: await callGeminiWithFallback('gemini-3-flash-preview', taskPrompt, null, 4096, sysPrompt) };
+                  result = { model: 'gemini-flash', output: await callGeminiWithFallback(DIRECT_MODELS["gemini-flash-cli"], taskPrompt, null, 4096, sysPrompt) };
                   break;
                 case 'gemini-pro':
-                  result = { model: 'gemini-pro', output: await callGeminiWithFallback('gemini-3.1-pro-preview', taskPrompt, null, 8192, sysPrompt) };
+                  result = { model: 'gemini-pro', output: await callGeminiWithFallback(DIRECT_MODELS["gemini-pro-cli"], taskPrompt, null, 8192, sysPrompt) };
                   break;
                 case 'openrouter':
                   result = { model: task.route.modelKey || 'deepseek', output: await callOpenRouterWithFallback(task.route.modelKey || 'deepseek', taskPrompt, null, 4096, sysPrompt) };
+                  break;
+                case 'deepseek-coder':
+                  result = { model: 'deepseek-coder', output: await callOpenRouterWithFallback('deepseek-coder', taskPrompt, null, 8192, sysPrompt) };
                   break;
                 case 'local':
                   if (LOCAL_SERVER_INFO.available) {
@@ -3400,7 +3391,7 @@ ${requirements}
                 case 'codex':
                   if (CODEX_AVAILABLE) {
                     result = { model: 'codex', output: await callCodexWithFallback(taskPrompt, null, {
-                      model: 'gpt-5.3-codex',
+                      model: DIRECT_MODELS["codex-default"],
                       sandbox: task.route.sandbox || 'read-only',
                       fullAuto: task.route.fullAuto || false,
                     })};
@@ -3487,7 +3478,7 @@ Return a JSON array of beads. ONLY output valid JSON, no markdown.`;
 
         let decomposedText;
         try {
-          decomposedText = await callGeminiWithFallback('gemini-3-flash-preview', decompositionPrompt, null, 8192);
+          decomposedText = await callGeminiWithFallback(DIRECT_MODELS["gemini-flash-cli"], decompositionPrompt, null, 8192);
         } catch {
           decomposedText = await callOpenRouterWithFallback('deepseek', decompositionPrompt, null, 8192);
         }
@@ -3685,10 +3676,10 @@ if (MMR_HTTP_PORT > 0) {
         { id: 'gemini-flash', name: 'Gemini Flash 3', owned_by: 'google', available: GEMINI_CLI_AVAILABLE || !!GEMINI_API_KEY },
         { id: 'deepseek', name: 'DeepSeek V3.2', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
         { id: 'qwen', name: 'Qwen 3.6 Plus', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
-        { id: 'glm-5.1', name: 'GLM 5.1 (Direct — Primary Coding)', owned_by: 'z.ai', available: GLM_AVAILABLE },
+        { id: 'glm-5.1', name: 'GLM 5.1 (Direct — Fallback Coding / Primary Security)', owned_by: 'z.ai', available: GLM_AVAILABLE },
         { id: 'glm', name: 'GLM-5 Turbo (OpenRouter fallback)', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
         { id: 'minimax', name: 'Minimax M2.7', owned_by: 'openrouter', available: !!OPENROUTER_API_KEY },
-        { id: 'codex', name: 'Codex CLI (gpt-5.3-codex)', owned_by: 'openai', available: CODEX_AVAILABLE },
+        { id: 'codex', name: 'Codex CLI (gpt-5.3-codex — Primary Coding)', owned_by: 'openai', available: CODEX_AVAILABLE },
         { id: 'copilot', name: 'GitHub Copilot', owned_by: 'github', available: COPILOT_AVAILABLE },
         { id: 'local', name: LOCAL_SERVER_INFO.available ? `Local (${LOCAL_SERVER_INFO.name})` : 'Local (not detected)', owned_by: 'local', available: LOCAL_SERVER_INFO.available },
       ];
@@ -3812,13 +3803,15 @@ if (MMR_HTTP_PORT > 0) {
     async function routeToProvider(model, modelKey, prompt, context, maxTokens, route, systemPrompt) {
       switch (model) {
         case 'gemini-pro':
-          return callGeminiWithFallback('gemini-3.1-pro-preview', prompt, context, maxTokens, systemPrompt);
+          return callGeminiWithFallback(DIRECT_MODELS["gemini-pro-cli"], prompt, context, maxTokens, systemPrompt);
         case 'gemini-flash':
-          return callGeminiWithFallback('gemini-3-flash-preview', prompt, context, maxTokens, systemPrompt);
+          return callGeminiWithFallback(DIRECT_MODELS["gemini-flash-cli"], prompt, context, maxTokens, systemPrompt);
         case 'openrouter':
           return callOpenRouterWithFallback(modelKey || 'deepseek', prompt, context, maxTokens, systemPrompt);
         case 'deepseek':
           return callOpenRouterWithFallback('deepseek', prompt, context, maxTokens, systemPrompt);
+        case 'deepseek-coder':
+          return callOpenRouterWithFallback('deepseek-coder', prompt, context, maxTokens, systemPrompt);
         case 'qwen':
           return callOpenRouterWithFallback('qwen', prompt, context, maxTokens, systemPrompt);
         case 'glm-direct':
